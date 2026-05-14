@@ -3,7 +3,7 @@ database.py — SQLite persistence layer.
 
 Replaces two CSV files:
   - .crawler_classification_cache.csv  → classification_cache table
-  - runs/<id>/results.csv              → run_results table
+  - runs/<id>/results.csv              → run_results table (optional CSV export remains available)
 
 Schema
 ------
@@ -191,9 +191,9 @@ def save_classification_cache(
 # ---------------------------------------------------------------------------
 
 def write_results_db(run_id: str, rows: List[ImageResult]) -> None:
-    """Insert all ImageResult rows for *run_id* into run_results."""
+    """Replace all stored rows for *run_id* with *rows* (canonical run snapshot)."""
     _ensure_init()
-    if not rows:
+    if not run_id:
         return
     created_at = datetime.now().isoformat(timespec="seconds")
     data = [
@@ -212,13 +212,44 @@ def write_results_db(run_id: str, rows: List[ImageResult]) -> None:
     try:
         conn = _connect()
         try:
-            conn.executemany(
+            conn.execute("DELETE FROM run_results WHERE run_id = ?", (run_id,))
+            if data:
+                conn.executemany(
+                    """
+                    INSERT INTO run_results
+                        (run_id, page_url, image_url, image_hash, label, score, reason, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    data,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def update_run_result_label(
+    run_id: str,
+    image_url: str,
+    label: str,
+    score: float,
+    reason: str,
+) -> None:
+    """Update label/score/reason for one row (e.g. manual correction in the webapp)."""
+    if not run_id or not image_url:
+        return
+    _ensure_init()
+    try:
+        conn = _connect()
+        try:
+            conn.execute(
                 """
-                INSERT INTO run_results
-                    (run_id, page_url, image_url, image_hash, label, score, reason, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE run_results
+                SET label = ?, score = ?, reason = ?
+                WHERE run_id = ? AND image_url = ?
                 """,
-                data,
+                (label, round(score, 6), reason, run_id, image_url),
             )
             conn.commit()
         finally:
@@ -263,3 +294,99 @@ def list_run_ids() -> List[str]:
             conn.close()
     except Exception:
         return []
+
+
+def get_run_summary(run_id: str) -> Dict:
+    """Return a summary dict for a single run (counts + created_at)."""
+    _ensure_init()
+    try:
+        conn = _connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*)                                       AS total,
+                    SUM(CASE WHEN label = 'table'    THEN 1 END)  AS tables,
+                    SUM(CASE WHEN label = 'normal'   THEN 1 END)  AS normal,
+                    SUM(CASE WHEN label = 'uncertain' THEN 1 END) AS uncertain,
+                    MIN(created_at)                                AS created_at
+                FROM run_results
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if row:
+                return {
+                    "total":     row["total"]     or 0,
+                    "tables":    row["tables"]    or 0,
+                    "normal":    row["normal"]    or 0,
+                    "uncertain": row["uncertain"] or 0,
+                    "created_at": row["created_at"] or "",
+                }
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return {"total": 0, "tables": 0, "normal": 0, "uncertain": 0, "created_at": ""}
+
+
+def delete_run(run_id: str) -> bool:
+    """Delete all rows for *run_id* from run_results. Returns True on success."""
+    if not run_id:
+        return False
+    _ensure_init()
+    try:
+        conn = _connect()
+        try:
+            conn.execute("DELETE FROM run_results WHERE run_id = ?", (run_id,))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def clear_classification_cache() -> int:
+    """Delete every row from classification_cache. Returns number of rows deleted."""
+    _ensure_init()
+    try:
+        conn = _connect()
+        try:
+            cur = conn.execute("DELETE FROM classification_cache")
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+
+
+def get_cache_stats() -> Dict:
+    """Return basic stats about the classification cache."""
+    _ensure_init()
+    try:
+        conn = _connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_entries,
+                    SUM(CASE WHEN label = 'table'    THEN 1 END) AS tables,
+                    SUM(CASE WHEN label = 'normal'   THEN 1 END) AS normal,
+                    SUM(CASE WHEN label = 'uncertain' THEN 1 END) AS uncertain
+                FROM classification_cache
+                """
+            ).fetchone()
+            if row:
+                return {
+                    "total_entries": row["total_entries"] or 0,
+                    "tables":        row["tables"]        or 0,
+                    "normal":        row["normal"]        or 0,
+                    "uncertain":     row["uncertain"]     or 0,
+                }
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return {"total_entries": 0, "tables": 0, "normal": 0, "uncertain": 0}

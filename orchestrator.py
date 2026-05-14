@@ -2,6 +2,7 @@ import argparse
 import concurrent.futures
 import csv
 import hashlib
+import io
 import os
 import re
 import threading
@@ -621,16 +622,27 @@ def crawl_site(
 # CSV export  (for CLI download; not the primary storage)
 # ---------------------------------------------------------------------------
 
+def _write_results_csv_to_file(f, rows: List[ImageResult]) -> None:
+    writer = csv.writer(f)
+    writer.writerow(["page_url", "image_url", "label", "score", "reason"])
+    for row in rows:
+        writer.writerow(
+            [row.page_url, row.image_url, row.label, f"{row.score:.4f}", row.reason]
+        )
+
+
+def format_results_csv_bytes(rows: List[ImageResult]) -> bytes:
+    """UTF-8 CSV payload (same columns as write_results_csv) without touching disk."""
+    buf = io.StringIO()
+    _write_results_csv_to_file(buf, rows)
+    return buf.getvalue().encode("utf-8")
+
+
 def write_results_csv(path: str, rows: List[ImageResult]) -> None:
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["page_url", "image_url", "label", "score", "reason"])
-        for row in rows:
-            writer.writerow(
-                [row.page_url, row.image_url, row.label, f"{row.score:.4f}", row.reason]
-            )
+        _write_results_csv_to_file(f, rows)
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +657,7 @@ def ask_yes_no(prompt: str, default: bool) -> bool:
     return raw in {"y", "yes"}
 
 
-def configure_run_from_prompt() -> Tuple[str, bool, str, float, bool, bool, int, str, int, List[str], List[str]]:
+def configure_run_from_prompt() -> Tuple[str, bool, str, float, bool, bool, int, str, int, List[str], List[str], str, str]:
     print("Interactive mode: enter options for this run.")
     url = input("Target URL: ").strip()
     while not url:
@@ -716,8 +728,10 @@ def configure_run_from_prompt() -> Tuple[str, bool, str, float, bool, bool, int,
             ocr_workers = default_workers
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path("runs") / run_id
-    output_path = str(run_dir / "results.csv")
+    save_csv = ask_yes_no(
+        "Also save a CSV copy under runs/<run_id>/results.csv?", False
+    )
+    output_path = str(Path("runs") / run_id / "results.csv") if save_csv else ""
     return (
         url,
         render_js,
@@ -730,6 +744,7 @@ def configure_run_from_prompt() -> Tuple[str, bool, str, float, bool, bool, int,
         max_pages,
         target_urls,
         listing_urls,
+        run_id,
     )
 
 
@@ -744,7 +759,11 @@ def main() -> None:
         )
     )
     parser.add_argument("url", nargs="?", help="Target page URL, e.g. https://example.com/page")
-    parser.add_argument("--output", default="", help="Output CSV path")
+    parser.add_argument(
+        "--output",
+        default="",
+        help="Optional path to write a CSV export (results are always stored in .crawler.db).",
+    )
     parser.add_argument(
         "--render-js",
         action="store_true",
@@ -809,8 +828,7 @@ def main() -> None:
 
     if args.url:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = Path("runs") / run_id
-        output_path = args.output or str(run_dir / "results.csv")
+        output_path = (args.output or "").strip()
         target_url = args.url
         render_js = args.render_js
         heartbeat_seconds = args.heartbeat_seconds
@@ -834,11 +852,15 @@ def main() -> None:
             max_pages,
             target_urls,
             listing_urls,
+            run_id,
         ) = configure_run_from_prompt()
-        run_id = Path(output_path).parent.name  # e.g. "20240101_120000"
 
-    print(f"[run] results CSV: {output_path}", flush=True)
+    if output_path:
+        print(f"[run] results CSV: {output_path}", flush=True)
+    else:
+        print("[run] results CSV: (not exporting; pass --output path.csv for a file)", flush=True)
     print(f"[run] results DB:  .crawler.db", flush=True)
+    print(f"[run] run_id:       {run_id}", flush=True)
     print(f"[run] fast mode:   {fast_mode}", flush=True)
     print(f"[run] turbo mode:  {turbo_mode}", flush=True)
     print(f"[run] ocr workers: {ocr_workers}", flush=True)
@@ -863,15 +885,18 @@ def main() -> None:
         target_urls=None if crawl_mode != "urls" else target_urls,
         listing_urls=listing_urls if crawl_mode == "paginated_listing" else None,
     )
-    # Write CSV for easy inspection; DB write already happened inside crawl_site.
-    write_results_csv(output_path, rows)
+    if output_path:
+        write_results_csv(output_path, rows)
 
     table_count = sum(1 for r in rows if r.label == "table")
     normal_count = len(rows) - table_count
     print(f"Processed images: {len(rows)}")
     print(f"Table:  {table_count}")
     print(f"Normal: {normal_count}")
-    print(f"CSV results: {output_path}")
+    if output_path:
+        print(f"CSV results: {output_path}")
+    else:
+        print("CSV results: (not written — use --output to export)")
     print(f"DB results:  .crawler.db  (run_id={run_id})")
 
 
