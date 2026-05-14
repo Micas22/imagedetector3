@@ -1,4 +1,3 @@
-import csv
 import hashlib
 import os
 import re
@@ -11,7 +10,6 @@ import cv2
 import numpy as np
 
 from constants import (
-    CACHE_FILENAME,
     CLASSIFIER_VERSION,
     DEFAULT_TABLE_SCORE_THRESHOLD,
     IMAGE_EXTENSIONS,
@@ -21,6 +19,7 @@ from constants import (
     _ocr_mkldnn_disabled,
     _thread_local,
 )
+from database import load_classification_cache, save_classification_cache  # noqa: F401 (re-exported)
 from table_transformer_adapter import classify_with_table_transformer
 
 try:
@@ -155,17 +154,10 @@ def _detect_table_grid_signal(img: np.ndarray) -> float:
     if h < 120 or w < 120:
         return 0.0
 
-    # Adaptive threshold highlights dark ruling lines on light backgrounds.
     binary = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        15,
-        4,
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 4,
     )
 
-    # Extract long horizontal and vertical line candidates.
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(12, w // 24), 1))
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(12, h // 24)))
     horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
@@ -181,7 +173,6 @@ def _detect_table_grid_signal(img: np.ndarray) -> float:
     v_ratio = v_pixels / image_pixels
     x_ratio = x_pixels / image_pixels
 
-    # Count distinct line runs to avoid treating a single box as a table.
     h_proj = (np.sum(horizontal > 0, axis=1) > max(6, w * 0.02)).astype(np.uint8)
     v_proj = (np.sum(vertical > 0, axis=0) > max(6, h * 0.02)).astype(np.uint8)
     h_runs = int(np.count_nonzero((h_proj[1:] == 1) & (h_proj[:-1] == 0)))
@@ -223,7 +214,6 @@ def column_stability(centers_x, centers_y, col_tolerance, row_tolerance):
     if not centers_x or not centers_y:
         return 0.0
 
-    # Step 1: cluster rows
     points = sorted(zip(centers_y, centers_x))
     rows = []
     current = [points[0][1]]
@@ -241,9 +231,8 @@ def column_stability(centers_x, centers_y, col_tolerance, row_tolerance):
         rows.append(current)
 
     if len(rows) < 3:
-        return 0.0  # not enough rows to be a table
+        return 0.0
 
-    # Step 2: build global column anchors
     all_x = sorted(centers_x)
     col_anchors = []
 
@@ -259,7 +248,6 @@ def column_stability(centers_x, centers_y, col_tolerance, row_tolerance):
     if len(col_anchors) < 2:
         return 0.0
 
-    # Step 3: check how consistently rows hit these anchors
     row_hits = []
 
     for row in rows:
@@ -271,7 +259,6 @@ def column_stability(centers_x, centers_y, col_tolerance, row_tolerance):
                     break
         row_hits.append(hits / len(col_anchors))
 
-    # Step 4: stability = consistency across rows
     mean = np.mean(row_hits)
     std = np.std(row_hits)
 
@@ -306,7 +293,6 @@ def _flatten_ocr_lines(raw_ocr) -> List[Tuple[List[List[float]], str, float]]:
     for chunk in chunks:
         if not chunk:
             continue
-        # Newer PaddleOCR `predict()` often returns dict-like results.
         if isinstance(chunk, dict) or hasattr(chunk, "keys"):
             payload = chunk if isinstance(chunk, dict) else dict(chunk)
             polys = payload.get("rec_polys") or payload.get("dt_polys") or []
@@ -327,7 +313,6 @@ def _flatten_ocr_lines(raw_ocr) -> List[Tuple[List[List[float]], str, float]]:
                     items.append((points, text, conf))
             continue
 
-        # Legacy PaddleOCR `ocr()` returns list-based line tuples.
         for line in chunk:
             if not line or len(line) < 2:
                 continue
@@ -360,20 +345,18 @@ def classify_image(
     flag_uncertain: bool = False,
 ) -> Tuple[str, float, str]:
     # Route table detection to Microsoft Table Transformer (detection model).
-    # Keep the original function signature so webapp/crawler callers remain compatible.
     label, score, reason = classify_with_table_transformer(
         image_bytes=image_bytes,
         image_url=image_url,
         table_score_threshold=table_score_threshold,
     )
     if label == "table" and score <= table_score_threshold:
-        # Preserve adapter-provided table decision even if numeric score is slightly below threshold.
-        # The adapter already performs its own structure verification.
         return "normal", score, f"{reason}_guarded_threshold"
     if flag_uncertain and label != "table" and score >= max(0.0, table_score_threshold * 0.9):
         return "uncertain", score, f"{reason}_near_threshold"
     return label, score, reason
 
+    # --- Legacy OCR path (unreachable while TATR is primary) -----------------
     img = safe_to_cv(image_bytes)
     if img is None:
         return "normal", 0.0, "decode_failed"
@@ -383,7 +366,6 @@ def classify_image(
         return "normal", 0.05, "too_small"
     aspect_ratio = float(max(h, w)) / float(max(1, min(h, w)))
     if turbo_mode and aspect_ratio >= 6.5 and min(h, w) < 280:
-        # Extreme thin banners/icons are very unlikely to be useful tables.
         return "normal", 0.02, "turbo_extreme_aspect_skip"
     if turbo_mode:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -391,7 +373,6 @@ def classify_image(
             return "normal", 0.02, "turbo_low_variance_skip"
     grid_region_signal = _detect_table_grid_signal(img)
 
-    # Large images are much slower for OCR; downscale while preserving layout.
     if turbo_mode:
         max_ocr_side = 560 if fast_mode else 1000
     else:
@@ -408,13 +389,10 @@ def classify_image(
     if ocr_engine is None:
         return "normal", 0.0, "paddleocr_not_installed"
 
-    # PaddleOCR runtime can hang/crash when accessed concurrently across threads.
-    # Serialize OCR calls even if image downloading/classification orchestration is parallel.
     with _ocr_lock:
         try:
             ocr_result = _run_ocr(ocr_engine, img)
         except Exception as first_error:
-            # Some Paddle builds crash with oneDNN enabled on CPU. Retry once after disabling it.
             if _is_mkldnn_runtime_error(first_error):
                 try:
                     _disable_mkldnn_if_possible()
@@ -475,19 +453,14 @@ def classify_image(
     uppercase_ratio = uppercase_alpha_chars / max(1, alpha_chars)
     long_alpha_ratio = long_alpha_tokens / max(1, alnum_tokens)
     alignment_signal = alignment_consistency(centers_x, tolerance=col_tolerance)
-    col_stability = column_stability(
-        centers_x,
-        centers_y,
-        col_tolerance,
-        row_tolerance
-    )
+    col_stability_val = column_stability(centers_x, centers_y, col_tolerance, row_tolerance)
 
     grid_likeness = min(1.0, (row_count * col_count) / max(1.0, line_count * 1.4))
     structure_signal = min(1.0, (max(0, row_count - 1) * max(0, col_count - 1)) / 24.0)
     density_signal = min(1.0, line_count / 45.0)
     keyword_signal = min(1.0, table_keyword_hits / 3.0)
     numeric_signal = min(1.0, numeric_ratio / 0.55)
-    stability_signal = col_stability
+    stability_signal = col_stability_val
 
     score = (
         0.28 * numeric_signal +
@@ -507,11 +480,9 @@ def classify_image(
         for hint_word in TABLE_URL_HINT_WORDS
     )
     if has_table_url_hint:
-        # Strongly prefer "table/tabela"-named assets, but never auto-classify.
         score += 0.22
     score = max(0.0, min(1.0, score))
 
-    # Require stronger geometric/table-like structure before labeling as table.
     has_strong_structure = (
         row_count >= 4
         and col_count >= 3
@@ -522,16 +493,14 @@ def classify_image(
     has_table_content = (
         numeric_ratio >= 0.18
         or table_keyword_hits >= 2
-        or (numeric_ratio >= 0.12 and numericish_tokens >= 4 and col_stability >= 0.6)
+        or (numeric_ratio >= 0.12 and numericish_tokens >= 4 and col_stability_val >= 0.6)
         or (has_table_url_hint and numeric_ratio >= 0.08)
     )
-    # Allow mixed-content images (table + surrounding paragraph text) to pass when
-    # table content signals are clear but full-frame grid structure is diluted.
     has_partial_table_structure = (
         row_count >= 3
         and col_count >= 3
         and line_count >= 7
-        and col_stability >= 0.52
+        and col_stability_val >= 0.52
         and structure_signal >= 0.08
         and (numeric_ratio >= 0.12 or table_keyword_hits >= 2 or grid_region_signal >= 0.44)
     )
@@ -540,7 +509,7 @@ def classify_image(
         and row_count >= 2
         and col_count >= 2
         and line_count >= 6
-        and col_stability >= 0.42
+        and col_stability_val >= 0.42
         and structure_signal >= 0.05
     )
     looks_like_poster_banner = (
@@ -555,7 +524,7 @@ def classify_image(
         score > table_score_threshold
         and has_table_content
         and not (looks_like_poster_banner and not has_strong_structure)
-        and (col_stability > (0.25 if has_table_url_hint else 0.35) or grid_region_signal >= 0.58)
+        and (col_stability_val > (0.25 if has_table_url_hint else 0.35) or grid_region_signal >= 0.58)
         and (has_strong_structure or has_partial_table_structure or has_hint_boosted_structure)
     )
     uncertain_margin = max(0.003, table_score_threshold * 0.08)
@@ -565,7 +534,7 @@ def classify_image(
         and score <= table_score_threshold
         and (table_score_threshold - score) <= uncertain_margin
         and has_table_content
-        and col_stability > (0.22 if has_table_url_hint else 0.3)
+        and col_stability_val > (0.22 if has_table_url_hint else 0.3)
     )
     reason = (
         f"ocr_lines{line_count}_rows{row_count}_cols{col_count}_"
@@ -580,107 +549,3 @@ def classify_image(
     if is_uncertain:
         return "uncertain", score, f"{reason}_near_threshold"
     return "normal", score, reason
-
-
-# ---------------------------------------------------------------------------
-# Table image saving
-# ---------------------------------------------------------------------------
-
-def save_table_image(save_dir: Path, image_url: str, image_bytes: bytes) -> Optional[Path]:
-    parsed = urlparse(image_url)
-    ext = Path(parsed.path).suffix.lower()
-    if ext not in IMAGE_EXTENSIONS:
-        ext = ".jpg"
-    digest = hashlib.sha1(image_url.encode("utf-8")).hexdigest()[:14]
-    name = f"table_{digest}{ext}"
-    out_path = save_dir / name
-    try:
-        out_path.write_bytes(image_bytes)
-        return out_path
-    except OSError:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Classification cache I/O
-# ---------------------------------------------------------------------------
-
-def load_classification_cache(
-    cache_path: Path,
-    fast_mode: bool,
-    turbo_mode: bool = False,
-    table_score_threshold: float = DEFAULT_TABLE_SCORE_THRESHOLD,
-    flag_uncertain: bool = False,
-) -> dict:
-    cache: dict = {}
-    if not cache_path.exists():
-        return cache
-    try:
-        with cache_path.open("r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if not row:
-                    continue
-                if row.get("classifier_version") != CLASSIFIER_VERSION:
-                    continue
-                if row.get("threshold") != f"{table_score_threshold:.4f}":
-                    continue
-                if row.get("fast_mode", "0") != ("1" if fast_mode else "0"):
-                    continue
-                if row.get("turbo_mode", "0") != ("1" if turbo_mode else "0"):
-                    continue
-                if row.get("flag_uncertain", "0") != ("1" if flag_uncertain else "0"):
-                    continue
-                image_hash = row.get("image_hash", "")
-                if not image_hash:
-                    continue
-                try:
-                    score = float(row.get("score", "0"))
-                except ValueError:
-                    continue
-                cache[image_hash] = (row.get("label", "normal"), score, row.get("reason", "cache_miss"))
-    except OSError:
-        return {}
-    return cache
-
-
-def save_classification_cache(
-    cache_path: Path,
-    cache: dict,
-    fast_mode: bool,
-    turbo_mode: bool = False,
-    table_score_threshold: float = DEFAULT_TABLE_SCORE_THRESHOLD,
-    flag_uncertain: bool = False,
-) -> None:
-    try:
-        with cache_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "image_hash",
-                    "label",
-                    "score",
-                    "reason",
-                    "classifier_version",
-                    "threshold",
-                    "fast_mode",
-                    "turbo_mode",
-                    "flag_uncertain",
-                ]
-            )
-            for image_hash, (label, score, reason) in cache.items():
-                writer.writerow(
-                    [
-                        image_hash,
-                        label,
-                        f"{score:.6f}",
-                        reason,
-                        CLASSIFIER_VERSION,
-                        f"{table_score_threshold:.4f}",
-                        "1" if fast_mode else "0",
-                        "1" if turbo_mode else "0",
-                        "1" if flag_uncertain else "0",
-                    ]
-                )
-    except OSError:
-        return

@@ -13,18 +13,17 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 
-from classifier import (
-    classify_image,
-    load_classification_cache,
-    save_classification_cache,
-    save_table_image,
-)
+from classifier import classify_image
 from constants import (
-    CACHE_FILENAME,
     DEFAULT_TABLE_SCORE_THRESHOLD,
     NON_HTML_EXTENSIONS,
     USER_AGENT,
     ImageResult,
+)
+from database import (
+    load_classification_cache,
+    save_classification_cache,
+    write_results_db,
 )
 from fetchers import JsRenderer, fetch_html, fetch_image_bytes, shared_session
 from parsers import (
@@ -42,8 +41,8 @@ from parsers import (
 
 def crawl_site(
     start_url: str,
+    run_id: str = "",
     render_js: bool = True,
-    save_table_dir: Optional[str] = None,
     heartbeat_seconds: float = 10.0,
     fast_mode: bool = False,
     turbo_mode: bool = False,
@@ -56,6 +55,13 @@ def crawl_site(
     target_urls: Optional[Sequence[str]] = None,
     listing_urls: Optional[Sequence[str]] = None,
 ) -> List[ImageResult]:
+    """
+    Crawl *start_url* and classify every image found.
+
+    Returns a list of ImageResult objects (each carries page_url, image_url,
+    label, score, reason, and image_hash).  Results are also persisted to the
+    SQLite database when *run_id* is provided.
+    """
     normalized_start = normalize_page_url(start_url)
     if normalized_start is None:
         raise ValueError("Invalid start URL. Example: https://example.com")
@@ -65,20 +71,14 @@ def crawl_site(
     renderer: Optional[JsRenderer] = None
     if render_js:
         renderer = JsRenderer()
-    table_dir: Optional[Path] = None
-    if save_table_dir:
-        table_dir = Path(save_table_dir)
-        table_dir.mkdir(parents=True, exist_ok=True)
 
-    visited_images = set()
+    visited_images: set = set()
     results: List[ImageResult] = []
-    table_saved = 0
     cache_hits = 0
     start_time = time.time()
     last_heartbeat = start_time
-    cache_path = Path(CACHE_FILENAME)
+
     classification_cache = load_classification_cache(
-        cache_path,
         fast_mode,
         turbo_mode,
         table_score_threshold=table_score_threshold,
@@ -93,10 +93,13 @@ def crawl_site(
         scan_scope = "paginated_listing"
     else:
         scan_scope = "single_page"
-    start_msg = f"[status] scan started | page={start_url} | scope={scan_scope} | render_js={render_js}"
+    start_msg = (
+        f"[status] scan started | page={start_url} | scope={scan_scope} | render_js={render_js}"
+    )
     print(start_msg, flush=True)
     if progress_callback is not None:
         progress_callback({"event": "status", "message": start_msg})
+
     parsed_start = urlparse(normalized_start)
     domain = parsed_start.netloc
     pages_to_scan: List[str] = []
@@ -108,11 +111,8 @@ def crawl_site(
         seen_pages = {normalized_start}
         while queue and len(pages_to_scan) < max(1, int(max_pages)):
             page_url = queue.pop(0)
-            # Avoid wasting crawl budget on pagination URLs.
-            # Sites often include page-n links that don't lead to meaningful new content.
             if re.search(r"([?&]|/)(page|p)=(\d+)", page_url, flags=re.IGNORECASE):
                 continue
-            # Skip non-HTML resources that somehow made it into the queue.
             _queue_path_lower = urlparse(page_url).path.lower()
             _queue_ext = Path(_queue_path_lower).suffix
             if _queue_ext and _queue_ext in NON_HTML_EXTENSIONS:
@@ -140,23 +140,19 @@ def crawl_site(
             pages_to_scan.append(page_url)
             page_html[page_url] = html
             links = extract_links(page_url, html, domain)
-
             print(f"[debug] {page_url} produced {len(links)} links")
-
             for link in links:
                 print(f"    -> {link}")
-
                 if link in seen_pages:
                     print(f"       SKIPPED (already seen)")
                     continue
-
                 seen_pages.add(link)
                 queue.append(link)
-
                 print(f"       ADDED TO QUEUE")
+
     elif crawl_mode == "urls":
         normalized_targets: List[str] = []
-        seen_targets = set()
+        seen_targets: set = set()
         for raw_url in target_urls or []:
             normalized_target = normalize_page_url(raw_url)
             if normalized_target is None or normalized_target in seen_targets:
@@ -187,20 +183,12 @@ def crawl_site(
             else:
                 html = fetch_html(session, target_url)
             if html is None:
-                print(f"[warn] failed fetch: {page_url}")
+                print(f"[warn] failed fetch: {target_url}")
                 continue
             pages_to_scan.append(target_url)
             page_html[target_url] = html
-    elif crawl_mode == "paginated_listing":
-        # ── Paginated listing crawl ────────────────────────────────────────────
-        # Supports one or more listing base URLs (normalized_start is always the
-        # first; extra ones come from listing_urls).  For each listing URL:
-        # 1. Fetch page 1 and auto-detect total pages (many fallback strategies).
-        # 2. Iterate ?page=2…N, harvesting card/item links via extract_listing_item_links.
-        # 3. Fetch every discovered detail page and add it to pages_to_scan.
-        # Image extraction happens in the shared loop below, same as other modes.
 
-        # Build the ordered list of listing base URLs (deduplicated).
+    elif crawl_mode == "paginated_listing":
         all_listing_base_urls: List[str] = [normalized_start]
         seen_listing_urls: set = {normalized_start}
         for raw_extra in listing_urls or []:
@@ -228,23 +216,27 @@ def crawl_site(
 
         total_listings = len(all_listing_base_urls)
         for listing_idx, base_listing_url in enumerate(all_listing_base_urls, start=1):
-            listing_label = f"listing {listing_idx}/{total_listings}" if total_listings > 1 else "listing"
-
-            fetch_msg = f"[status] paginated_listing: fetching {listing_label} page 1 -> {base_listing_url}"
+            listing_label = (
+                f"listing {listing_idx}/{total_listings}" if total_listings > 1 else "listing"
+            )
+            fetch_msg = (
+                f"[status] paginated_listing: fetching {listing_label} page 1 -> {base_listing_url}"
+            )
             print(fetch_msg, flush=True)
             if progress_callback is not None:
-                progress_callback({
-                    "event": "status",
-                    "message": fetch_msg,
-                    "phase": "fetching_listing_page",
-                    "page_url": base_listing_url,
-                    "page_index": 1,
-                    "listing_index": listing_idx,
-                    "listing_total": total_listings,
-                })
+                progress_callback(
+                    {
+                        "event": "status",
+                        "message": fetch_msg,
+                        "phase": "fetching_listing_page",
+                        "page_url": base_listing_url,
+                        "page_index": 1,
+                        "listing_index": listing_idx,
+                        "listing_total": total_listings,
+                    }
+                )
 
             first_html = _fetch_page(base_listing_url)
-
             if first_html is None:
                 warn_msg = (
                     f"[warn] paginated_listing: failed to fetch first page of {listing_label}: "
@@ -270,36 +262,33 @@ def crawl_site(
                 )
 
             total_pages = min(total_pages, max(1, int(max_pages)))
-
             listing_page_htmls[base_listing_url] = first_html
             _harvest_items(base_listing_url, first_html)
 
             for page_num in range(2, total_pages + 1):
-                # Build paginated URL: set or replace ?page=N while keeping other query params.
                 parsed_base = urlparse(base_listing_url)
                 existing_qs = dict(parse_qsl(parsed_base.query, keep_blank_values=True))
                 existing_qs["page"] = str(page_num)
                 listing_page_url = urlunparse(parsed_base._replace(query=urlencode(existing_qs)))
-
                 fetch_msg = (
                     f"[status] paginated_listing: fetching {listing_label} "
                     f"page {page_num}/{total_pages} -> {listing_page_url}"
                 )
                 print(fetch_msg, flush=True)
                 if progress_callback is not None:
-                    progress_callback({
-                        "event": "status",
-                        "message": fetch_msg,
-                        "phase": "fetching_listing_page",
-                        "page_url": listing_page_url,
-                        "page_index": page_num,
-                        "page_total": total_pages,
-                        "listing_index": listing_idx,
-                        "listing_total": total_listings,
-                    })
-
+                    progress_callback(
+                        {
+                            "event": "status",
+                            "message": fetch_msg,
+                            "phase": "fetching_listing_page",
+                            "page_url": listing_page_url,
+                            "page_index": page_num,
+                            "page_total": total_pages,
+                            "listing_index": listing_idx,
+                            "listing_total": total_listings,
+                        }
+                    )
                 lhtml = _fetch_page(listing_page_url)
-
                 if lhtml is None:
                     print(
                         f"[warn] paginated_listing: failed fetch {listing_label} "
@@ -307,7 +296,6 @@ def crawl_site(
                         flush=True,
                     )
                     continue
-
                 listing_page_htmls[listing_page_url] = lhtml
                 _harvest_items(listing_page_url, lhtml)
 
@@ -327,36 +315,36 @@ def crawl_site(
             flush=True,
         )
 
-        # Add listing pages themselves to pages_to_scan (their images count too).
         for lurl, lhtml in listing_page_htmls.items():
             pages_to_scan.append(lurl)
             page_html[lurl] = lhtml
 
-        # Fetch each item/detail page.
         total_items = len(item_links)
         for idx, item_url in enumerate(item_links, start=1):
-            fetch_msg = f"[status] paginated_listing: fetching item page {idx}/{total_items} -> {item_url}"
+            fetch_msg = (
+                f"[status] paginated_listing: fetching item page {idx}/{total_items} -> {item_url}"
+            )
             print(fetch_msg, flush=True)
             if progress_callback is not None:
-                progress_callback({
-                    "event": "status",
-                    "message": fetch_msg,
-                    "phase": "fetching_item_page",
-                    "page_url": item_url,
-                    "page_index": idx,
-                    "page_total": total_items,
-                })
-
+                progress_callback(
+                    {
+                        "event": "status",
+                        "message": fetch_msg,
+                        "phase": "fetching_item_page",
+                        "page_url": item_url,
+                        "page_index": idx,
+                        "page_total": total_items,
+                    }
+                )
             ihtml = _fetch_page(item_url)
-
             if ihtml is None:
                 print(f"[warn] paginated_listing: failed fetch item page: {item_url}", flush=True)
                 continue
-
             pages_to_scan.append(item_url)
             page_html[item_url] = ihtml
 
     else:
+        # Single-page mode
         fetch_msg = f"[status] fetching target page -> {normalized_start}"
         print(fetch_msg, flush=True)
         if progress_callback is not None:
@@ -399,7 +387,10 @@ def crawl_site(
         for image_url in image_urls:
             page_image_pairs.append((page_url, image_url))
 
-    found_msg = f"[status] found {len(page_image_pairs)} raw image candidates across {len(pages_to_scan)} page(s)"
+    found_msg = (
+        f"[status] found {len(page_image_pairs)} raw image candidates "
+        f"across {len(pages_to_scan)} page(s)"
+    )
     print(found_msg, flush=True)
 
     unique_image_items: List[Tuple[str, str]] = []
@@ -427,15 +418,21 @@ def crawl_site(
     in_flight_hashes: Dict[str, threading.Event] = {}
     workers = max(1, int(ocr_workers))
 
-    def process_image(page_url: str, image_url: str) -> Optional[Tuple[str, str, str, float, str, bytes, bool]]:
+    def process_image(
+        page_url: str, image_url: str
+    ) -> Optional[Tuple[str, str, str, float, str, str, bool]]:
+        """Returns (page_url, image_url, label, score, reason, image_hash, was_cached)."""
         local_session = shared_session()
-        content, fetch_reason = fetch_image_bytes(local_session, image_url, page_url, turbo_mode=turbo_mode)
+        content, fetch_reason = fetch_image_bytes(
+            local_session, image_url, page_url, turbo_mode=turbo_mode
+        )
         if not content:
-            return page_url, image_url, "normal", 0.0, fetch_reason, b"", False
+            return page_url, image_url, "normal", 0.0, fetch_reason, "", False
 
         image_hash = hashlib.sha1(content).hexdigest()
         owns_classification = False
         wait_event: Optional[threading.Event] = None
+
         with cache_lock:
             cached = classification_cache.get(image_hash)
             if cached is None:
@@ -444,16 +441,24 @@ def crawl_site(
                     wait_event = threading.Event()
                     in_flight_hashes[image_hash] = wait_event
                     owns_classification = True
+
         if cached is not None:
-            return page_url, image_url, cached[0], cached[1], cached[2], content, True
+            return page_url, image_url, cached[0], cached[1], cached[2], image_hash, True
 
         if not owns_classification and wait_event is not None:
             wait_event.wait()
             with cache_lock:
                 cached_after_wait = classification_cache.get(image_hash)
             if cached_after_wait is not None:
-                return page_url, image_url, cached_after_wait[0], cached_after_wait[1], cached_after_wait[2], content, True
-            # Fallback if the owner thread failed unexpectedly before caching.
+                return (
+                    page_url,
+                    image_url,
+                    cached_after_wait[0],
+                    cached_after_wait[1],
+                    cached_after_wait[2],
+                    image_hash,
+                    True,
+                )
             owns_classification = True
             with cache_lock:
                 replacement_event = in_flight_hashes.get(image_hash)
@@ -472,13 +477,12 @@ def crawl_site(
                 table_score_threshold=table_score_threshold,
                 flag_uncertain=flag_uncertain,
             )
-            # Defensive guard: never allow table labels below the configured threshold.
             if label == "table" and score <= table_score_threshold:
                 label = "normal"
                 reason = f"{reason}_guarded_threshold"
             with cache_lock:
                 classification_cache[image_hash] = (label, score, reason)
-            return page_url, image_url, label, score, reason, content, False
+            return page_url, image_url, label, score, reason, image_hash, False
         finally:
             if wait_event is not None and owns_classification:
                 with cache_lock:
@@ -492,6 +496,7 @@ def crawl_site(
     stalled_seconds = 0.0
     max_stalled_seconds = max(45.0, float(heartbeat_seconds) * 6.0)
     skipped_due_to_stall = 0
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         for page_url, image_url in unique_image_items:
             future = executor.submit(process_image, page_url, image_url)
@@ -515,27 +520,22 @@ def crawl_site(
                 completed += 1
                 outcome = future.result()
                 if outcome is not None:
-                    page_url, image_url, label, score, reason, content, was_cached = outcome
+                    p_url, i_url, label, score, reason, image_hash, was_cached = outcome
                     if was_cached:
                         cache_hits += 1
-                    results.append(ImageResult(page_url, image_url, label, score, reason))
-                    if label == "table" and table_dir is not None:
-                        saved = save_table_image(table_dir, image_url, content)
-                        if saved is not None:
-                            table_saved += 1
+                    results.append(ImageResult(p_url, i_url, label, score, reason, image_hash))
                     if progress_callback is not None:
                         progress_callback(
                             {
                                 "event": "image_processed",
                                 "processed": completed,
                                 "total": len(unique_image_items),
-                                "page_url": page_url,
+                                "page_url": p_url,
                                 "label": label,
                                 "score": score,
                                 "reason": reason,
-                                "image_url": image_url,
+                                "image_url": i_url,
                                 "cached": was_cached,
-                                "tables_saved": table_saved,
                             }
                         )
 
@@ -543,7 +543,9 @@ def crawl_site(
             if now - last_heartbeat >= heartbeat_seconds:
                 elapsed = now - start_time
                 print(
-                    f"[heartbeat] running {elapsed:.1f}s | processed={completed}/{len(unique_image_items)} | classified={len(results)}",
+                    f"[heartbeat] running {elapsed:.1f}s | "
+                    f"processed={completed}/{len(unique_image_items)} | "
+                    f"classified={len(results)}",
                     flush=True,
                 )
                 if progress_callback is not None:
@@ -555,7 +557,6 @@ def crawl_site(
                             "total": len(unique_image_items),
                             "classified": len(results),
                             "cache_hits": cache_hits,
-                            "tables_saved": table_saved,
                         }
                     )
                 last_heartbeat = now
@@ -576,8 +577,8 @@ def crawl_site(
 
     if renderer is not None:
         renderer.close()
+
     save_classification_cache(
-        cache_path,
         classification_cache,
         fast_mode,
         turbo_mode,
@@ -585,11 +586,16 @@ def crawl_site(
         flag_uncertain=flag_uncertain,
     )
 
+    # Persist results to the database.
+    if run_id:
+        write_results_db(run_id, results)
+
     total_elapsed = time.time() - start_time
     done_msg = (
         f"[status] scan finished in {total_elapsed:.1f}s | pages={len(pages_to_scan)} "
-        f"| raw_candidates={len(page_image_pairs)} | unique_images={unique_total} | processed={len(results)} "
-        f"| skipped_stalled={skipped_due_to_stall} | tables_saved={table_saved} | cache_hits={cache_hits}"
+        f"| raw_candidates={len(page_image_pairs)} | unique_images={unique_total} "
+        f"| processed={len(results)} | skipped_stalled={skipped_due_to_stall} "
+        f"| cache_hits={cache_hits}"
     )
     print(done_msg, flush=True)
     if progress_callback is not None:
@@ -604,7 +610,6 @@ def crawl_site(
                 "unique_candidates": unique_total,
                 "processed": len(results),
                 "skipped_due_to_stall": skipped_due_to_stall,
-                "tables_saved": table_saved,
                 "cache_hits": cache_hits,
             }
         )
@@ -613,7 +618,7 @@ def crawl_site(
 
 
 # ---------------------------------------------------------------------------
-# CSV output
+# CSV export  (for CLI download; not the primary storage)
 # ---------------------------------------------------------------------------
 
 def write_results_csv(path: str, rows: List[ImageResult]) -> None:
@@ -623,7 +628,9 @@ def write_results_csv(path: str, rows: List[ImageResult]) -> None:
         writer = csv.writer(f)
         writer.writerow(["page_url", "image_url", "label", "score", "reason"])
         for row in rows:
-            writer.writerow([row.page_url, row.image_url, row.label, f"{row.score:.4f}", row.reason])
+            writer.writerow(
+                [row.page_url, row.image_url, row.label, f"{row.score:.4f}", row.reason]
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -638,13 +645,15 @@ def ask_yes_no(prompt: str, default: bool) -> bool:
     return raw in {"y", "yes"}
 
 
-def configure_run_from_prompt() -> Tuple[str, bool, str, str, float, bool, bool, int, str, int, List[str], List[str]]:
+def configure_run_from_prompt() -> Tuple[str, bool, str, float, bool, bool, int, str, int, List[str], List[str]]:
     print("Interactive mode: enter options for this run.")
     url = input("Target URL: ").strip()
     while not url:
         url = input("Target URL (required): ").strip()
 
-    scan_whole_site = ask_yes_no("Scan whole website (same domain) instead of only this page?", False)
+    scan_whole_site = ask_yes_no(
+        "Scan whole website (same domain) instead of only this page?", False
+    )
     crawl_mode = "site" if scan_whole_site else "page"
     target_urls: List[str] = []
     if crawl_mode == "page" and ask_yes_no("Scan multiple specific URLs only?", False):
@@ -655,11 +664,18 @@ def configure_run_from_prompt() -> Tuple[str, bool, str, str, float, bool, bool,
             if not candidate:
                 break
             target_urls.append(candidate)
-    if crawl_mode == "page" and ask_yes_no("Crawl a paginated news/events listing (follows all cards across pages)?", False):
+    if crawl_mode == "page" and ask_yes_no(
+        "Crawl a paginated news/events listing (follows all cards across pages)?", False
+    ):
         crawl_mode = "paginated_listing"
     listing_urls: List[str] = []
-    if crawl_mode == "paginated_listing" and ask_yes_no("Add more paginated listing URLs to crawl together?", False):
-        print("Paste listing URLs one per line (in addition to the target URL above). Submit an empty line when done.")
+    if crawl_mode == "paginated_listing" and ask_yes_no(
+        "Add more paginated listing URLs to crawl together?", False
+    ):
+        print(
+            "Paste listing URLs one per line (in addition to the target URL above). "
+            "Submit an empty line when done."
+        )
         while True:
             candidate = input("Listing URL: ").strip()
             if not candidate:
@@ -667,20 +683,22 @@ def configure_run_from_prompt() -> Tuple[str, bool, str, str, float, bool, bool,
             listing_urls.append(candidate)
     max_pages = 40
     if crawl_mode in {"site"}:
-        max_pages_prompt = (
-            "Max pages to scan on this site (default 40)"
-        )
-        max_pages_raw = input(max_pages_prompt).strip()
+        max_pages_raw = input("Max pages to scan on this site (default 40)").strip()
         if max_pages_raw:
             try:
                 max_pages = max(1, int(max_pages_raw))
             except ValueError:
                 max_pages = 40
 
-    render_js = ask_yes_no("Use JavaScript rendering (recommended for modern sites)?", True)
-    fast_mode = ask_yes_no("Enable fast OCR mode (about 2x faster, slightly less accurate)?", False)
-    turbo_mode = ask_yes_no("Enable TURBO mode (much faster, lower OCR quality + aggressive skipping)?", True)
-    save_tables = ask_yes_no("Save detected table images to a folder?", True)
+    render_js = ask_yes_no(
+        "Use JavaScript rendering (recommended for modern sites)?", True
+    )
+    fast_mode = ask_yes_no(
+        "Enable fast OCR mode (about 2x faster, slightly less accurate)?", False
+    )
+    turbo_mode = ask_yes_no(
+        "Enable TURBO mode (much faster, lower OCR quality + aggressive skipping)?", True
+    )
     heartbeat_raw = input("Heartbeat seconds (default 10): ").strip()
     heartbeat_seconds = 10.0
     if heartbeat_raw:
@@ -700,12 +718,10 @@ def configure_run_from_prompt() -> Tuple[str, bool, str, str, float, bool, bool,
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path("runs") / run_id
     output_path = str(run_dir / "results.csv")
-    table_dir = str(run_dir / "table_images") if save_tables else ""
     return (
         url,
         render_js,
         output_path,
-        table_dir,
         heartbeat_seconds,
         fast_mode,
         turbo_mode,
@@ -723,7 +739,9 @@ def configure_run_from_prompt() -> Tuple[str, bool, str, str, float, bool, bool,
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Scan one webpage, discover images, and classify each as normal or table screenshot."
+        description=(
+            "Scan one webpage, discover images, and classify each as normal or table screenshot."
+        )
     )
     parser.add_argument("url", nargs="?", help="Target page URL, e.g. https://example.com/page")
     parser.add_argument("--output", default="", help="Output CSV path")
@@ -731,11 +749,6 @@ def main() -> None:
         "--render-js",
         action="store_true",
         help="Render pages with JavaScript (needed for some websites that lazy-load images).",
-    )
-    parser.add_argument(
-        "--save-table-images",
-        default="",
-        help="If set, saves images classified as table to this folder path.",
     )
     parser.add_argument(
         "--heartbeat-seconds",
@@ -751,7 +764,10 @@ def main() -> None:
     parser.add_argument(
         "--turbo",
         action="store_true",
-        help="Aggressive speed mode: lower OCR quality, skip obvious non-tables, and fail image fetches faster.",
+        help=(
+            "Aggressive speed mode: lower OCR quality, skip obvious non-tables, "
+            "and fail image fetches faster."
+        ),
     )
     parser.add_argument(
         "--ocr-workers",
@@ -763,7 +779,10 @@ def main() -> None:
         "--crawl-mode",
         choices=["page", "site", "urls", "paginated_listing"],
         default="page",
-        help="Scan one page, crawl same-domain pages across the site, scan only specified URLs, or crawl a paginated listing (news/events) following all cards.",
+        help=(
+            "Scan one page, crawl same-domain pages across the site, "
+            "scan only specified URLs, or crawl a paginated listing."
+        ),
     )
     parser.add_argument(
         "--max-pages",
@@ -781,7 +800,10 @@ def main() -> None:
         "--listing-urls",
         nargs="+",
         default=[],
-        help="Additional paginated listing base URLs to crawl alongside the main URL when --crawl-mode=paginated_listing.",
+        help=(
+            "Additional paginated listing base URLs to crawl alongside the main URL "
+            "when --crawl-mode=paginated_listing."
+        ),
     )
     args = parser.parse_args()
 
@@ -789,7 +811,6 @@ def main() -> None:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = Path("runs") / run_id
         output_path = args.output or str(run_dir / "results.csv")
-        table_dir = args.save_table_images or str(run_dir / "table_images")
         target_url = args.url
         render_js = args.render_js
         heartbeat_seconds = args.heartbeat_seconds
@@ -805,7 +826,6 @@ def main() -> None:
             target_url,
             render_js,
             output_path,
-            table_dir,
             heartbeat_seconds,
             fast_mode,
             turbo_mode,
@@ -815,24 +835,25 @@ def main() -> None:
             target_urls,
             listing_urls,
         ) = configure_run_from_prompt()
+        run_id = Path(output_path).parent.name  # e.g. "20240101_120000"
 
-    print(f"[run] results file: {output_path}", flush=True)
-    print(f"[run] table images folder: {table_dir}", flush=True)
-    print(f"[run] fast mode: {fast_mode}", flush=True)
-    print(f"[run] turbo mode: {turbo_mode}", flush=True)
+    print(f"[run] results CSV: {output_path}", flush=True)
+    print(f"[run] results DB:  .crawler.db", flush=True)
+    print(f"[run] fast mode:   {fast_mode}", flush=True)
+    print(f"[run] turbo mode:  {turbo_mode}", flush=True)
     print(f"[run] ocr workers: {ocr_workers}", flush=True)
-    print(f"[run] crawl mode: {crawl_mode}", flush=True)
+    print(f"[run] crawl mode:  {crawl_mode}", flush=True)
     if crawl_mode in {"site", "paginated_listing"}:
-        print(f"[run] max pages: {max_pages}", flush=True)
+        print(f"[run] max pages:   {max_pages}", flush=True)
     if crawl_mode == "urls":
         print(f"[run] target urls: {len(target_urls)}", flush=True)
     if crawl_mode == "paginated_listing" and listing_urls:
-        print(f"[run] additional listing urls: {len(listing_urls)}", flush=True)
+        print(f"[run] extra listing urls: {len(listing_urls)}", flush=True)
 
     rows = crawl_site(
         start_url=target_url,
+        run_id=run_id,
         render_js=render_js,
-        save_table_dir=table_dir or None,
         heartbeat_seconds=heartbeat_seconds,
         fast_mode=fast_mode,
         turbo_mode=turbo_mode,
@@ -842,15 +863,16 @@ def main() -> None:
         target_urls=None if crawl_mode != "urls" else target_urls,
         listing_urls=listing_urls if crawl_mode == "paginated_listing" else None,
     )
+    # Write CSV for easy inspection; DB write already happened inside crawl_site.
     write_results_csv(output_path, rows)
 
     table_count = sum(1 for r in rows if r.label == "table")
     normal_count = len(rows) - table_count
     print(f"Processed images: {len(rows)}")
-    print(f"Table: {table_count}")
+    print(f"Table:  {table_count}")
     print(f"Normal: {normal_count}")
-    print(f"Saved results: {output_path}")
-    print(f"Saved table images folder: {table_dir}")
+    print(f"CSV results: {output_path}")
+    print(f"DB results:  .crawler.db  (run_id={run_id})")
 
 
 if __name__ == "__main__":

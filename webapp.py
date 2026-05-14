@@ -11,15 +11,14 @@ import requests
 import streamlit as st
 
 from constants import (
-    CACHE_FILENAME,
     DEFAULT_TABLE_SCORE_THRESHOLD,
     ImageResult,
 )
-from classifier import (
-    classify_image,
+from classifier import classify_image
+from database import (
     load_classification_cache,
     save_classification_cache,
-    save_table_image,
+    write_results_db,
 )
 from orchestrator import (
     crawl_site,
@@ -76,7 +75,11 @@ with st.sidebar:
     preset = st.radio(
         "Preset",
         options=["full_precision", "full_speed", "custom"],
-        format_func=lambda x: {"full_precision": "Full Precision", "full_speed": "Full Speed", "custom": "Custom"}[x],
+        format_func=lambda x: {
+            "full_precision": "Full Precision",
+            "full_speed": "Full Speed",
+            "custom": "Custom",
+        }[x],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -125,7 +128,10 @@ with st.sidebar:
             listing_urls_input = st.text_area(
                 "Additional listing URLs (one per line, optional)",
                 placeholder="https://example.com/events\nhttps://example.com/news",
-                help="Crawl multiple paginated listings in one run. Each URL gets its own page-count detection. The Target URL above is always included as the first listing.",
+                help=(
+                    "Crawl multiple paginated listings in one run. Each URL gets its own "
+                    "page-count detection. The Target URL above is always included as the first listing."
+                ),
                 height=110,
             )
     else:
@@ -136,7 +142,9 @@ with st.sidebar:
             horizontal=True,
         )[0]
         if single_image_source == "url":
-            single_image_url = st.text_input("Image URL", placeholder="https://example.com/image.png")
+            single_image_url = st.text_input(
+                "Image URL", placeholder="https://example.com/image.png"
+            )
         else:
             uploaded_single_image = st.file_uploader(
                 "Upload image",
@@ -158,8 +166,8 @@ with st.sidebar:
         )
     run_id = st.text_input("Run ID", value=default_run_id)
     base_run_dir = st.text_input("Base run folder", value="runs")
-
     output_filename = st.text_input("CSV filename", value="results.csv")
+
     # Derive preset overrides
     _preset_fast_mode = {"full_precision": False, "full_speed": True}.get(preset, None)
     _preset_turbo_mode = {"full_precision": False, "full_speed": True}.get(preset, None)
@@ -189,28 +197,18 @@ with st.sidebar:
         value=False,
         help="Marks images as uncertain when they are very close to being labeled as a table.",
     )
-    save_tables = st.toggle("Save detected table images", value=True)
     heartbeat_seconds = st.number_input("Heartbeat seconds", min_value=1.0, value=10.0, step=1.0)
     ocr_workers = st.number_input("OCR workers", min_value=1, value=default_workers, step=1)
 
-    custom_table_dir = st.text_input(
-        "Optional custom table images folder",
-        value="",
-        help="Leave blank to use <base_run_folder>/<run_id>/table_images when saving is enabled.",
-    )
-
 run_dir = Path(base_run_dir) / run_id
 output_path = str(run_dir / output_filename)
-table_dir = ""
-if save_tables:
-    table_dir = custom_table_dir.strip() or str(run_dir / "table_images")
 
 st.markdown("### Output Preview")
 col1, col2 = st.columns(2)
 with col1:
     st.code(output_path, language="text")
 with col2:
-    st.code(table_dir or "(table image saving disabled)", language="text")
+    st.code(".crawler.db", language="text")
 
 progress_bar = st.progress(0)
 status_box = st.empty()
@@ -231,8 +229,6 @@ if "_crawl_running" not in st.session_state:
 # ── gallery / correction session state ───────────────────────────────────────
 if "_scan_results" not in st.session_state:
     st.session_state["_scan_results"] = None
-if "_scan_table_dir" not in st.session_state:
-    st.session_state["_scan_table_dir"] = ""
 if "_scan_output_path" not in st.session_state:
     st.session_state["_scan_output_path"] = ""
 if "_scan_run_config" not in st.session_state:
@@ -241,31 +237,29 @@ if "_manually_marked_normal" not in st.session_state:
     st.session_state["_manually_marked_normal"] = set()
 
 
-def _apply_mark_as_normal(img_path: Path, image_url: str) -> None:
-    """Read saved image bytes → update classification cache → update rows + CSV."""
-    try:
-        image_bytes = img_path.read_bytes()
-    except OSError as exc:
-        st.error(f"Could not read image file: {exc}")
+def _apply_mark_as_normal(image_hash: str, image_url: str) -> None:
+    """Update the classification cache and in-memory rows; rewrite the CSV."""
+    if not image_hash:
+        st.error("Cannot mark as normal: image hash is unavailable for this result.")
         return
 
-    image_hash = hashlib.sha1(image_bytes).hexdigest()
     run_cfg = st.session_state.get("_scan_run_config", {})
     fast = run_cfg.get("fast_mode", False)
     turbo = run_cfg.get("turbo_mode", False)
     threshold = run_cfg.get("table_score_threshold", DEFAULT_TABLE_SCORE_THRESHOLD)
     flag_unc = run_cfg.get("flag_uncertain", False)
 
-    # ── Update the on-disk classification cache ───────────────────────────────
-    cache_path = Path(CACHE_FILENAME)
-    cache = load_classification_cache(cache_path, fast, turbo, threshold, flag_unc)
+    # ── Update the SQLite classification cache ────────────────────────────────
+    cache = load_classification_cache(fast, turbo, threshold, flag_unc)
     cache[image_hash] = ("normal", 0.0, "manually_marked_normal")
-    save_classification_cache(cache_path, cache, fast, turbo, threshold, flag_unc)
+    save_classification_cache(cache, fast, turbo, threshold, flag_unc)
 
     # ── Update in-memory rows so the rest of the UI stays consistent ──────────
     current_rows: List[ImageResult] = st.session_state.get("_scan_results") or []
     updated_rows = [
-        ImageResult(r.page_url, r.image_url, "normal", 0.0, "manually_marked_normal")
+        ImageResult(
+            r.page_url, r.image_url, "normal", 0.0, "manually_marked_normal", r.image_hash
+        )
         if r.image_url == image_url
         else r
         for r in current_rows
@@ -295,15 +289,38 @@ def _render_metrics(
     classified_total: int = 0,
 ) -> None:
     c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
-    classified_label = f"{classified}/{classified_total}" if classified_total > 0 else str(classified)
-    c1.markdown(f'<div class="metric-card"><b>Processed</b><br>{processed}</div>', unsafe_allow_html=True)
-    c2.markdown(f'<div class="metric-card"><b>Total</b><br>{total}</div>', unsafe_allow_html=True)
-    c3.markdown(f'<div class="metric-card"><b>Classified</b><br>{classified_label}</div>', unsafe_allow_html=True)
-    c4.markdown(f'<div class="metric-card"><b>Tables</b><br>{tables}</div>', unsafe_allow_html=True)
-    c5.markdown(f'<div class="metric-card"><b>Normal</b><br>{normal}</div>', unsafe_allow_html=True)
-    c6.markdown(f'<div class="metric-card"><b>Cache Hits</b><br>{cache_hits}</div>', unsafe_allow_html=True)
-    c7.markdown(f'<div class="metric-card"><b>Crawl Time (s)</b><br>{crawl_elapsed_s:.1f}</div>', unsafe_allow_html=True)
-    c8.markdown(f'<div class="metric-card"><b>Classify Time (s)</b><br>{elapsed_s:.1f}</div>', unsafe_allow_html=True)
+    classified_label = (
+        f"{classified}/{classified_total}" if classified_total > 0 else str(classified)
+    )
+    c1.markdown(
+        f'<div class="metric-card"><b>Processed</b><br>{processed}</div>',
+        unsafe_allow_html=True,
+    )
+    c2.markdown(
+        f'<div class="metric-card"><b>Total</b><br>{total}</div>', unsafe_allow_html=True
+    )
+    c3.markdown(
+        f'<div class="metric-card"><b>Classified</b><br>{classified_label}</div>',
+        unsafe_allow_html=True,
+    )
+    c4.markdown(
+        f'<div class="metric-card"><b>Tables</b><br>{tables}</div>', unsafe_allow_html=True
+    )
+    c5.markdown(
+        f'<div class="metric-card"><b>Normal</b><br>{normal}</div>', unsafe_allow_html=True
+    )
+    c6.markdown(
+        f'<div class="metric-card"><b>Cache Hits</b><br>{cache_hits}</div>',
+        unsafe_allow_html=True,
+    )
+    c7.markdown(
+        f'<div class="metric-card"><b>Crawl Time (s)</b><br>{crawl_elapsed_s:.1f}</div>',
+        unsafe_allow_html=True,
+    )
+    c8.markdown(
+        f'<div class="metric-card"><b>Classify Time (s)</b><br>{elapsed_s:.1f}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def _build_interactive_html_report(
@@ -329,7 +346,9 @@ def _build_interactive_html_report(
     uncertain_rows = sum(1 for row in rows_payload if row["label"] == "uncertain")
     normal_rows = total_rows - table_rows - uncertain_rows
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    avg_score = (sum(float(row["score"]) for row in rows_payload) / total_rows) if total_rows else 0.0
+    avg_score = (
+        (sum(float(row["score"]) for row in rows_payload) / total_rows) if total_rows else 0.0
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -338,413 +357,146 @@ def _build_interactive_html_report(
   <title>Report - {html.escape(run_id)}</title>
   <style>
     :root {{
-      --bg: #f3f7ff;
-      --bg-2: #eef2ff;
-      --text: #0f172a;
-      --muted: #475569;
-      --panel: rgba(255, 255, 255, 0.9);
-      --panel-border: rgba(148, 163, 184, 0.26);
-      --shadow: 0 10px 35px rgba(2, 6, 23, 0.08);
-      --primary: #2563eb;
-      --primary-2: #0ea5e9;
-      --table-head: #eff6ff;
-      --row-alt: #f8fbff;
-      --chip-table-bg: #dcfce7;
-      --chip-table-fg: #166534;
-      --chip-normal-bg: #e2e8f0;
-      --chip-normal-fg: #334155;
-      --chip-uncertain-bg: #fef3c7;
-      --chip-uncertain-fg: #92400e;
+      --bg: #f3f7ff; --bg-2: #eef2ff; --text: #0f172a; --muted: #475569;
+      --panel: rgba(255,255,255,0.9); --panel-border: rgba(148,163,184,0.26);
+      --shadow: 0 10px 35px rgba(2,6,23,0.08); --primary: #2563eb;
+      --primary-2: #0ea5e9; --table-head: #eff6ff; --row-alt: #f8fbff;
+      --chip-table-bg: #dcfce7; --chip-table-fg: #166534;
+      --chip-normal-bg: #e2e8f0; --chip-normal-fg: #334155;
+      --chip-uncertain-bg: #fef3c7; --chip-uncertain-fg: #92400e;
     }}
     @media (prefers-color-scheme: dark) {{
       :root {{
-        --bg: #0b1224;
-        --bg-2: #111b34;
-        --text: #e2e8f0;
-        --muted: #94a3b8;
-        --panel: rgba(15, 23, 42, 0.75);
-        --panel-border: rgba(71, 85, 105, 0.45);
-        --shadow: 0 16px 45px rgba(2, 6, 23, 0.45);
-        --primary: #60a5fa;
-        --primary-2: #22d3ee;
-        --table-head: #0f172a;
-        --row-alt: #111827;
-        --chip-table-bg: #14532d;
-        --chip-table-fg: #dcfce7;
-        --chip-normal-bg: #334155;
-        --chip-normal-fg: #e2e8f0;
-        --chip-uncertain-bg: #78350f;
-        --chip-uncertain-fg: #fde68a;
+        --bg: #0b1224; --bg-2: #111b34; --text: #e2e8f0; --muted: #94a3b8;
+        --panel: rgba(15,23,42,0.75); --panel-border: rgba(71,85,105,0.45);
+        --shadow: 0 16px 45px rgba(2,6,23,0.45); --primary: #60a5fa;
+        --primary-2: #22d3ee; --table-head: #1e293b; --row-alt: #0f172a;
+        --chip-table-bg: #14532d; --chip-table-fg: #86efac;
+        --chip-normal-bg: #1e293b; --chip-normal-fg: #94a3b8;
+        --chip-uncertain-bg: #78350f; --chip-uncertain-fg: #fde68a;
       }}
     }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      font-family: Inter, Segoe UI, Roboto, Arial, sans-serif;
-      color: var(--text);
-      background: radial-gradient(circle at 5% 5%, #bfdbfe 0%, transparent 30%),
-        radial-gradient(circle at 95% 10%, #a5f3fc 0%, transparent 30%),
-        linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
-      min-height: 100vh;
-      padding: 24px;
-    }}
-    .shell {{ max-width: 1320px; margin: 0 auto; }}
-    .hero {{
-      background: linear-gradient(115deg, rgba(37, 99, 235, 0.92), rgba(14, 165, 233, 0.9));
-      color: #ffffff;
-      border-radius: 18px;
-      box-shadow: var(--shadow);
-      padding: 20px 22px;
-      margin-bottom: 16px;
-    }}
-    .hero h1 {{ margin: 0 0 8px; font-size: 30px; letter-spacing: -0.02em; }}
-    .hero .sub {{ opacity: 0.95; font-size: 14px; }}
-    .meta {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-      gap: 8px;
-      margin-top: 12px;
-      font-size: 13px;
-    }}
-    .meta-item {{
-      background: rgba(255, 255, 255, 0.16);
-      border: 1px solid rgba(255, 255, 255, 0.24);
-      border-radius: 10px;
-      padding: 8px 10px;
-      backdrop-filter: blur(6px);
-    }}
-    .cards {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-      gap: 12px;
-      margin-bottom: 14px;
-    }}
-    .card {{
-      background: var(--panel);
-      border: 1px solid var(--panel-border);
-      border-radius: 14px;
-      padding: 12px 14px;
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(8px);
-    }}
-    .card .k {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }}
-    .card .v {{ font-size: 28px; font-weight: 700; margin-top: 4px; line-height: 1.1; }}
-    .toolbar {{
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      align-items: center;
-      padding: 12px;
-      margin-bottom: 10px;
-      border-radius: 14px;
-      background: var(--panel);
-      border: 1px solid var(--panel-border);
-      box-shadow: var(--shadow);
-    }}
-    .toolbar input, .toolbar select, .toolbar button {{
-      padding: 10px 12px;
-      border: 1px solid var(--panel-border);
-      border-radius: 10px;
-      font-size: 13px;
-      background: rgba(255, 255, 255, 0.82);
-      color: #0f172a;
-    }}
-    @media (prefers-color-scheme: dark) {{
-      .toolbar input, .toolbar select, .toolbar button {{
-        background: rgba(15, 23, 42, 0.85);
-        color: #e2e8f0;
-      }}
-    }}
-    .toolbar input {{ min-width: 260px; flex: 1; }}
-    .toolbar button {{
-      background: linear-gradient(120deg, var(--primary), var(--primary-2));
-      color: white;
-      border: none;
-      font-weight: 600;
-      cursor: pointer;
-      transition: transform 0.15s ease, box-shadow 0.15s ease;
-    }}
-    .toolbar button:hover {{ transform: translateY(-1px); box-shadow: 0 8px 20px rgba(37, 99, 235, 0.3); }}
-    .table-wrap {{
-      overflow: auto;
-      border-radius: 14px;
-      border: 1px solid var(--panel-border);
-      box-shadow: var(--shadow);
-      background: var(--panel);
-    }}
-    table {{ width: 100%; border-collapse: collapse; min-width: 900px; }}
-    th, td {{ border-bottom: 1px solid var(--panel-border); padding: 10px; vertical-align: top; font-size: 13px; }}
-    th {{
-      position: sticky;
-      top: 0;
-      z-index: 2;
-      background: var(--table-head);
-      cursor: pointer;
-      user-select: none;
-      text-align: left;
-      white-space: nowrap;
-    }}
-    tbody tr:nth-child(even) {{ background: var(--row-alt); }}
-    tbody tr:hover {{ background: rgba(14, 165, 233, 0.12); }}
-    .url {{ max-width: 410px; word-break: break-word; }}
-    .url a {{ color: var(--primary); text-decoration: none; }}
-    .url a:hover {{ text-decoration: underline; }}
-    .badge {{ display: inline-block; border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 600; }}
-    .b-table {{ background: var(--chip-table-bg); color: var(--chip-table-fg); }}
-    .b-normal {{ background: var(--chip-normal-bg); color: var(--chip-normal-fg); }}
-    .b-uncertain {{ background: var(--chip-uncertain-bg); color: var(--chip-uncertain-fg); }}
-    .score-wrap {{
-      min-width: 140px;
-      display: grid;
-      grid-template-columns: 58px 1fr;
-      gap: 8px;
-      align-items: center;
-    }}
-    .score-bar {{
-      height: 8px;
-      border-radius: 999px;
-      background: rgba(148, 163, 184, 0.25);
-      overflow: hidden;
-    }}
-    .score-fill {{
-      height: 100%;
-      border-radius: 999px;
-      background: linear-gradient(90deg, #22c55e, #0ea5e9, #6366f1);
-    }}
-    .foot {{
-      margin-top: 10px;
-      color: var(--muted);
-      font-size: 12px;
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      flex-wrap: wrap;
-    }}
-    .pill {{
-      display: inline-flex;
-      align-items: center;
-      border: 1px solid var(--panel-border);
-      border-radius: 999px;
-      padding: 5px 10px;
-      background: var(--panel);
-    }}
-    .empty {{
-      padding: 26px;
-      text-align: center;
-      color: var(--muted);
-      font-size: 14px;
-    }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; padding: 2rem; }}
+    h1 {{ font-size: 1.8rem; font-weight: 700; margin-bottom: .25rem; }}
+    .meta {{ color: var(--muted); font-size: .85rem; margin-bottom: 1.5rem; }}
+    .stats {{ display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; }}
+    .stat {{ background: var(--panel); border: 1px solid var(--panel-border);
+             border-radius: 12px; padding: .75rem 1.25rem; min-width: 110px; }}
+    .stat b {{ display: block; font-size: 1.4rem; }}
+    .stat span {{ font-size: .78rem; color: var(--muted); }}
+    .filters {{ display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }}
+    .filter-btn {{ padding: .4rem .9rem; border-radius: 9999px; border: 1px solid var(--panel-border);
+                   cursor: pointer; background: var(--panel); color: var(--text); font-size: .82rem; }}
+    .filter-btn.active {{ background: var(--primary); color: #fff; border-color: var(--primary); }}
+    #search {{ padding: .4rem .8rem; border-radius: 8px; border: 1px solid var(--panel-border);
+               background: var(--panel); color: var(--text); font-size: .85rem; width: 280px; }}
+    table {{ width: 100%; border-collapse: collapse; background: var(--panel);
+             border-radius: 12px; overflow: hidden; box-shadow: var(--shadow); }}
+    th {{ background: var(--table-head); padding: .6rem 1rem; text-align: left;
+          font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }}
+    td {{ padding: .55rem 1rem; font-size: .83rem; border-top: 1px solid var(--panel-border); }}
+    tr:nth-child(even) td {{ background: var(--row-alt); }}
+    .chip {{ display: inline-block; border-radius: 9999px; padding: .15rem .6rem; font-size: .75rem; font-weight: 600; }}
+    .chip-table {{ background: var(--chip-table-bg); color: var(--chip-table-fg); }}
+    .chip-normal {{ background: var(--chip-normal-bg); color: var(--chip-normal-fg); }}
+    .chip-uncertain {{ background: var(--chip-uncertain-bg); color: var(--chip-uncertain-fg); }}
+    a {{ color: var(--primary); text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    .trunc {{ max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }}
+    #count {{ color: var(--muted); font-size: .82rem; margin-bottom: .5rem; }}
+    .img-thumb {{ max-width: 80px; max-height: 48px; border-radius: 4px; object-fit: contain; }}
   </style>
 </head>
 <body>
-  <div class="shell">
-    <section class="hero">
-      <h1>Report</h1>
-      <div class="sub">Visual audit of image classification output with live filtering and client-side export.</div>
-      <div class="meta">
-        <div class="meta-item"><b>Run ID</b><br />{html.escape(run_id)}</div>
-        <div class="meta-item"><b>Target</b><br />{html.escape(target)}</div>
-        <div class="meta-item"><b>Generated</b><br />{html.escape(generated_at)}</div>
-        <div class="meta-item"><b>CSV Source</b><br />{html.escape(output_path)}</div>
-      </div>
-    </section>
-
-    <section class="cards">
-      <div class="card"><div class="k">Visible Rows</div><div id="metric-total" class="v">{total_rows}</div></div>
-      <div class="card"><div class="k">Tables</div><div id="metric-table" class="v">{table_rows}</div></div>
-      <div class="card"><div class="k">Uncertain</div><div id="metric-uncertain" class="v">{uncertain_rows}</div></div>
-      <div class="card"><div class="k">Normal</div><div id="metric-normal" class="v">{normal_rows}</div></div>
-      <div class="card"><div class="k">Avg Score</div><div id="metric-avg-score" class="v">{avg_score:.3f}</div></div>
-      <div class="card"><div class="k">Elapsed</div><div class="v">{float(totals.get("elapsed_seconds", 0.0)):.1f}s</div></div>
-      <div class="card"><div class="k">Cache Hits</div><div class="v">{int(totals.get("cache_hits", 0))}</div></div>
-    </section>
-
-    <section class="toolbar">
-      <input id="search" placeholder="Search by URL, label, score, reason..." />
-      <select id="labelFilter">
-        <option value="">All labels</option>
-        <option value="table">table</option>
-        <option value="uncertain">uncertain</option>
-        <option value="normal">normal</option>
-      </select>
-      <select id="scoreFilter">
-        <option value="">Any score</option>
-        <option value="gte_0.25">Score >= 0.25</option>
-        <option value="gte_0.5">Score >= 0.50</option>
-        <option value="gte_0.75">Score >= 0.75</option>
-      </select>
-      <button id="downloadFilteredCsv">Download filtered CSV</button>
-      <span class="pill" id="visibleCount"></span>
-    </section>
-
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th data-sort="page_url">Page URL</th>
-            <th data-sort="image_url">Image URL</th>
-            <th data-sort="label">Label</th>
-            <th data-sort="score">Score</th>
-            <th data-sort="reason">Reason</th>
-          </tr>
-        </thead>
-        <tbody id="tbody"></tbody>
-      </table>
-      <div id="emptyState" class="empty" style="display:none;">No rows match your current filters.</div>
-    </div>
-
-    <div class="foot">
-      <span>Tip: click table headers to sort ascending/descending.</span>
-      <span id="sortStatus">Sorted by score (desc)</span>
-    </div>
+  <h1>Crawler Report</h1>
+  <p class="meta">Run ID: {html.escape(run_id)} &nbsp;|&nbsp; Target: {html.escape(target)} &nbsp;|&nbsp; Generated: {generated_at}</p>
+  <div class="stats">
+    <div class="stat"><b>{total_rows}</b><span>Total images</span></div>
+    <div class="stat"><b>{table_rows}</b><span>Tables</span></div>
+    <div class="stat"><b>{normal_rows}</b><span>Normal</span></div>
+    <div class="stat"><b>{uncertain_rows}</b><span>Uncertain</span></div>
+    <div class="stat"><b>{avg_score:.3f}</b><span>Avg score</span></div>
+    <div class="stat"><b>{int(totals.get('pages_scanned', 0))}</b><span>Pages scanned</span></div>
+    <div class="stat"><b>{int(totals.get('cache_hits', 0))}</b><span>Cache hits</span></div>
+    <div class="stat"><b>{float(totals.get('elapsed_seconds', 0)):.1f}s</b><span>Classify time</span></div>
   </div>
-
+  <div class="filters">
+    <button class="filter-btn active" onclick="setFilter('all')">All ({total_rows})</button>
+    <button class="filter-btn" onclick="setFilter('table')">Tables ({table_rows})</button>
+    <button class="filter-btn" onclick="setFilter('normal')">Normal ({normal_rows})</button>
+    <button class="filter-btn" onclick="setFilter('uncertain')">Uncertain ({uncertain_rows})</button>
+    <input id="search" type="text" placeholder="Search URL or reason..." oninput="applyFilters()" />
+  </div>
+  <p id="count"></p>
+  <table id="tbl">
+    <thead><tr>
+      <th>Preview</th><th>Label</th><th>Score</th>
+      <th>Image URL</th><th>Page URL</th><th>Reason</th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
   <script>
-    const rows = {payload_json};
-    let sortKey = "score";
-    let sortAsc = false;
-
-    function labelBadge(label) {{
-      const cls = label === "table" ? "b-table" : (label === "uncertain" ? "b-uncertain" : "b-normal");
-      return `<span class="badge ${{cls}}">${{label}}</span>`;
+    const DATA = {payload_json};
+    let currentFilter = 'all';
+    function chip(label) {{
+      const cls = label === 'table' ? 'chip-table' : label === 'uncertain' ? 'chip-uncertain' : 'chip-normal';
+      return `<span class="chip ${{cls}}">${{label}}</span>`;
     }}
-
-    function escapeHtml(v) {{
-      return String(v ?? "").replace(/[&<>"']/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}}[c]));
+    function setFilter(f) {{
+      currentFilter = f;
+      document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+      event.target.classList.add('active');
+      applyFilters();
     }}
-
-    function filteredRows() {{
-      const q = document.getElementById("search").value.toLowerCase().trim();
-      const filter = document.getElementById("labelFilter").value;
-      const scoreFilter = document.getElementById("scoreFilter").value;
-      return rows.filter(r => {{
-        if (filter && r.label !== filter) return false;
-        if (scoreFilter === "gte_0.25" && Number(r.score) < 0.25) return false;
-        if (scoreFilter === "gte_0.5" && Number(r.score) < 0.5) return false;
-        if (scoreFilter === "gte_0.75" && Number(r.score) < 0.75) return false;
-        if (!q) return true;
-        return [r.page_url, r.image_url, r.reason, r.label, String(r.score)]
-          .join(" ")
-          .toLowerCase()
-          .includes(q);
-      }});
-    }}
-
-    function sortRows(list) {{
-      return list.slice().sort((a, b) => {{
-        const av = a[sortKey];
-        const bv = b[sortKey];
-        let cmp = 0;
-        if (sortKey === "score") cmp = Number(av) - Number(bv);
-        else cmp = String(av).localeCompare(String(bv));
-        return sortAsc ? cmp : -cmp;
-      }});
-    }}
-
-    function render() {{
-      const tbody = document.getElementById("tbody");
-      const data = sortRows(filteredRows());
-      const emptyState = document.getElementById("emptyState");
-      tbody.innerHTML = data.map(r => `
+    function applyFilters() {{
+      const q = document.getElementById('search').value.toLowerCase();
+      const rows = DATA.filter(r =>
+        (currentFilter === 'all' || r.label === currentFilter) &&
+        (!q || r.image_url.toLowerCase().includes(q) || r.page_url.toLowerCase().includes(q) || r.reason.toLowerCase().includes(q))
+      );
+      document.getElementById('count').textContent = rows.length + ' result(s)';
+      document.getElementById('tbody').innerHTML = rows.map(r => `
         <tr>
-          <td class="url"><a href="${{escapeHtml(r.page_url)}}" target="_blank" rel="noreferrer">${{escapeHtml(r.page_url)}}</a></td>
-          <td class="url"><a href="${{escapeHtml(r.image_url)}}" target="_blank" rel="noreferrer">${{escapeHtml(r.image_url)}}</a></td>
-          <td>${{labelBadge(escapeHtml(r.label))}}</td>
-          <td>
-            <div class="score-wrap">
-              <span>${{Number(r.score).toFixed(4)}}</span>
-              <div class="score-bar"><div class="score-fill" style="width:${{Math.max(0, Math.min(100, Number(r.score) * 100))}}%"></div></div>
-            </div>
-          </td>
-          <td class="url">${{escapeHtml(r.reason)}}</td>
-        </tr>`).join("");
-      emptyState.style.display = data.length ? "none" : "block";
-      document.getElementById("visibleCount").textContent = `Showing ${{data.length}} / ${{rows.length}} rows`;
-      document.getElementById("metric-total").textContent = String(data.length);
-      document.getElementById("metric-table").textContent = String(data.filter(r => r.label === "table").length);
-      document.getElementById("metric-uncertain").textContent = String(data.filter(r => r.label === "uncertain").length);
-      document.getElementById("metric-normal").textContent = String(data.filter(r => r.label === "normal").length);
-      const avg = data.length ? (data.reduce((acc, r) => acc + Number(r.score), 0) / data.length) : 0;
-      document.getElementById("metric-avg-score").textContent = avg.toFixed(3);
-      document.getElementById("sortStatus").textContent = `Sorted by ${{sortKey}} (${{sortAsc ? "asc" : "desc"}})`;
+          <td><img class="img-thumb" src="${{r.image_url}}" alt="" loading="lazy" onerror="this.style.display='none'" /></td>
+          <td>${{chip(r.label)}}</td>
+          <td>${{r.score.toFixed(4)}}</td>
+          <td><a href="${{r.image_url}}" target="_blank" class="trunc" title="${{r.image_url}}">${{r.image_url}}</a></td>
+          <td><a href="${{r.page_url}}" target="_blank" class="trunc" title="${{r.page_url}}">${{r.page_url}}</a></td>
+          <td><span class="trunc" title="${{r.reason}}">${{r.reason}}</span></td>
+        </tr>`).join('');
     }}
-
-    document.getElementById("search").addEventListener("input", render);
-    document.getElementById("labelFilter").addEventListener("change", render);
-    document.getElementById("scoreFilter").addEventListener("change", render);
-    document.querySelectorAll("th[data-sort]").forEach(th => {{
-      th.addEventListener("click", () => {{
-        const key = th.getAttribute("data-sort");
-        if (sortKey === key) sortAsc = !sortAsc;
-        else {{ sortKey = key; sortAsc = true; }}
-        render();
-      }});
-    }});
-
-    document.getElementById("downloadFilteredCsv").addEventListener("click", () => {{
-      const data = sortRows(filteredRows());
-      const header = ["page_url","image_url","label","score","reason"];
-      const csvRows = [header.join(",")].concat(data.map(r => header.map(k => {{
-        const val = String(r[k] ?? "").replace(/"/g, '""');
-        return /[",\\n]/.test(val) ? `"${{val}}"` : val;
-      }}).join(",")));
-      const blob = new Blob([csvRows.join("\\n")], {{ type: "text/csv;charset=utf-8;" }});
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "filtered_results.csv";
-      a.click();
-      URL.revokeObjectURL(url);
-    }});
-
-    render();
+    applyFilters();
   </script>
 </body>
 </html>"""
 
 
-col_start, col_stop = st.columns([3, 1])
-with col_start:
-    start_clicked = st.button("Start Scan", type="primary", use_container_width=True)
-with col_stop:
-    stop_clicked = st.button(
-        "⏹ Stop Crawl",
-        use_container_width=True,
-        disabled=not st.session_state.get("_crawl_running", False),
-        help="Gracefully abort the current crawl/classify run.",
-    )
+# ── Scan / evaluate button ────────────────────────────────────────────────────
+_scan_button_label = "🔍 Evaluate Image" if eval_mode == "single_image" else "🔍 Start Scan"
+_scan_clicked = st.button(
+    _scan_button_label,
+    type="primary",
+    use_container_width=True,
+    disabled=bool(st.session_state.get("_crawl_running")),
+)
 
-if stop_clicked and st.session_state.get("_stop_event") is not None:
-    st.session_state["_stop_event"].set()
-    st.warning("Stop signal sent — the crawl will finish its current image and then halt.")
+parsed_target_urls: List[str] = (
+    [u.strip() for u in target_urls_input.splitlines() if u.strip()]
+    if crawl_mode == "urls"
+    else []
+)
+parsed_listing_urls: List[str] = (
+    [u.strip() for u in listing_urls_input.splitlines() if u.strip()]
+    if crawl_mode == "paginated_listing"
+    else []
+)
 
-if start_clicked:
-    parsed_target_urls = [line.strip() for line in target_urls_input.splitlines() if line.strip()] if crawl_mode == "urls" else []
-    parsed_listing_urls = [line.strip() for line in listing_urls_input.splitlines() if line.strip()] if crawl_mode == "paginated_listing" else []
-
-    if eval_mode == "crawl" and crawl_mode == "urls" and not parsed_target_urls:
-        st.error("Provide at least one URL in 'Target URLs'.")
-        st.stop()
-    if eval_mode == "crawl" and crawl_mode != "urls" and not url.strip():
-        st.error("Target URL is required.")
-        st.stop()
-    if eval_mode == "single_image" and single_image_source == "url" and not single_image_url.strip():
-        st.error("Image URL is required.")
-        st.stop()
-    if eval_mode == "single_image" and single_image_source == "upload" and uploaded_single_image is None:
-        st.error("Upload an image file.")
-        st.stop()
-
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    # Clear any gallery state from a previous run so stale corrections don't bleed in.
-    st.session_state["_scan_results"] = None
-    st.session_state["_manually_marked_normal"] = set()
-
-    # Initialise stop signal for this run.
+if _scan_clicked:
     stop_event = threading.Event()
     st.session_state["_stop_event"] = stop_event
     st.session_state["_crawl_running"] = True
+    st.session_state["_manually_marked_normal"] = set()
 
     crawl_wall_start = time.monotonic()
 
@@ -771,14 +523,11 @@ if start_clicked:
     status_box.info("Starting scan...")
 
     def _on_progress(event: dict) -> None:
-
-        # Honour stop signal — raise to break out of the executor loop in crawl_site.
+        # Honour stop signal.
         if stop_event.is_set():
             raise StopIteration("stop_requested")
 
         event_type = event.get("event", "")
-
-        # Snapshot wall-clock times so every branch can use them.
         now_mono = time.monotonic()
         totals["crawl_elapsed_seconds"] = now_mono - crawl_wall_start
 
@@ -794,19 +543,28 @@ if start_clicked:
                 status_box.info(f"Crawling page: {page_url}")
             else:
                 status_box.info(event.get("message", "Running..."))
+
         elif event_type == "discovered":
-            # Crawling phase is done; classification is starting now.
             totals["classify_wall_start"] = now_mono
-            totals["raw_candidates"] = int(event.get("total_candidates", totals["raw_candidates"]))
-            totals["unique_candidates"] = int(event.get("unique_candidates", totals["unique_candidates"]))
-            totals["total"] = int(event.get("unique_candidates", event.get("total_candidates", totals["total"])))
+            totals["raw_candidates"] = int(
+                event.get("total_candidates", totals["raw_candidates"])
+            )
+            totals["unique_candidates"] = int(
+                event.get("unique_candidates", totals["unique_candidates"])
+            )
+            totals["total"] = int(
+                event.get("unique_candidates", event.get("total_candidates", totals["total"]))
+            )
             totals["classified_total"] = totals["total"]
             status_box.info(event.get("message", "Discovered image candidates."))
             split_box.caption(
-                f"Candidates: raw {int(totals['raw_candidates'])} -> unique {int(totals['unique_candidates'])} | "
-                f"processed {int(totals['processed'])} | fetch failures {int(totals['fetch_failures'])} | "
+                f"Candidates: raw {int(totals['raw_candidates'])} -> "
+                f"unique {int(totals['unique_candidates'])} | "
+                f"processed {int(totals['processed'])} | "
+                f"fetch failures {int(totals['fetch_failures'])} | "
                 f"skipped stalled {int(totals['skipped_due_to_stall'])}"
             )
+
         elif event_type == "heartbeat":
             totals["elapsed_seconds"] = float(event.get("elapsed_seconds", 0.0))
             totals["processed"] = int(event.get("processed", totals["processed"]))
@@ -815,6 +573,7 @@ if start_clicked:
                 f"Running... {int(totals['processed'])}/{int(max(1, totals['total']))} processed | "
                 f"cache hits: {int(totals['cache_hits'])}"
             )
+
         elif event_type == "image_processed":
             totals["processed"] = int(event.get("processed", totals["processed"]))
             totals["total"] = int(event.get("total", totals["total"]))
@@ -857,22 +616,35 @@ if start_clicked:
                     classified_total=int(totals["classified_total"]),
                 )
             split_box.caption(
-                f"Candidates: raw {int(totals['raw_candidates'])} -> unique {int(totals['total'])} | "
-                f"processed {int(totals['processed'])} | fetch failures {int(totals['fetch_failures'])} | "
+                f"Candidates: raw {int(totals['raw_candidates'])} -> "
+                f"unique {int(totals['total'])} | "
+                f"processed {int(totals['processed'])} | "
+                f"fetch failures {int(totals['fetch_failures'])} | "
                 f"skipped stalled {int(totals['skipped_due_to_stall'])}"
             )
+
         elif event_type == "error":
             status_box.error(event.get("message", "An error occurred while scanning."))
+
         elif event_type == "finished":
-            totals["elapsed_seconds"] = float(event.get("elapsed_seconds", totals["elapsed_seconds"]))
-            totals["raw_candidates"] = int(event.get("raw_candidates", totals["raw_candidates"]))
-            totals["unique_candidates"] = int(event.get("unique_candidates", totals["unique_candidates"]))
+            totals["elapsed_seconds"] = float(
+                event.get("elapsed_seconds", totals["elapsed_seconds"])
+            )
+            totals["raw_candidates"] = int(
+                event.get("raw_candidates", totals["raw_candidates"])
+            )
+            totals["unique_candidates"] = int(
+                event.get("unique_candidates", totals["unique_candidates"])
+            )
             totals["processed"] = int(event.get("processed", totals["processed"]))
-            totals["skipped_due_to_stall"] = int(event.get("skipped_due_to_stall", totals["skipped_due_to_stall"]))
+            totals["skipped_due_to_stall"] = int(
+                event.get("skipped_due_to_stall", totals["skipped_due_to_stall"])
+            )
             status_box.success(event.get("message", "Scan finished."))
 
     threshold_multiplier = float(table_confidence) / 100.0
     configured_threshold = DEFAULT_TABLE_SCORE_THRESHOLD * threshold_multiplier
+
     if eval_mode == "single_image":
         status_box.info("Evaluating single image...")
         if single_image_source == "url":
@@ -889,11 +661,17 @@ if start_clicked:
                 st.stop()
             resolved_image_url = single_url
         else:
-            image_bytes = uploaded_single_image.getvalue() if uploaded_single_image is not None else b""
+            image_bytes = (
+                uploaded_single_image.getvalue() if uploaded_single_image is not None else b""
+            )
             if not image_bytes:
                 st.error("Uploaded image is empty.")
                 st.stop()
-            upload_name = uploaded_single_image.name if uploaded_single_image is not None else "uploaded_image"
+            upload_name = (
+                uploaded_single_image.name
+                if uploaded_single_image is not None
+                else "uploaded_image"
+            )
             resolved_image_url = f"upload://{upload_name}"
 
         label, score, reason = classify_image(
@@ -904,26 +682,42 @@ if start_clicked:
             table_score_threshold=configured_threshold,
             flag_uncertain=flag_uncertain,
         )
+        image_hash = hashlib.sha1(image_bytes).hexdigest()
         source_page = single_image_page_url.strip() or resolved_image_url
-        rows = [ImageResult(page_url=source_page, image_url=resolved_image_url, label=label, score=score, reason=reason)]
+        rows = [
+            ImageResult(
+                page_url=source_page,
+                image_url=resolved_image_url,
+                label=label,
+                score=score,
+                reason=reason,
+                image_hash=image_hash,
+            )
+        ]
         totals["processed"] = 1
         totals["total"] = 1
         totals["elapsed_seconds"] = 0.0
         totals["tables"] = 1 if label == "table" else 0
         totals["uncertain"] = 1 if label == "uncertain" else 0
         totals["normal"] = 1 if label == "normal" else 0
-        if table_dir and label == "table":
-            save_table_image(Path(table_dir), resolved_image_url, image_bytes)
         progress_bar.progress(1.0)
         status_box.success("Single image evaluation finished.")
+
     else:
         with stop_btn_box.container():
             st.info("Crawl/classify is running. Use the ⏹ Stop Crawl button to abort.")
+            if st.button("⏹ Stop Crawl", type="secondary"):
+                if st.session_state.get("_stop_event") is not None:
+                    st.session_state["_stop_event"].set()
         try:
             rows = crawl_site(
-                start_url=(url.strip() if url.strip() else (parsed_target_urls[0] if parsed_target_urls else "")),
+                start_url=(
+                    url.strip()
+                    if url.strip()
+                    else (parsed_target_urls[0] if parsed_target_urls else "")
+                ),
+                run_id=run_id,
                 render_js=True,
-                save_table_dir=table_dir or None,
                 heartbeat_seconds=float(heartbeat_seconds),
                 fast_mode=fast_mode,
                 turbo_mode=turbo_mode,
@@ -945,12 +739,11 @@ if start_clicked:
     st.session_state["_crawl_running"] = False
     st.session_state["_stop_event"] = None
 
+    # Write CSV for download; DB write already happened inside crawl_site.
     write_results_csv(output_path, rows)
 
-    # Persist results so the interactive gallery stays alive across reruns
-    # triggered by "Mark as Normal" button clicks.
+    # Persist results so the interactive gallery stays alive across reruns.
     st.session_state["_scan_results"] = list(rows)
-    st.session_state["_scan_table_dir"] = table_dir
     st.session_state["_scan_output_path"] = output_path
     st.session_state["_scan_run_config"] = {
         "fast_mode": fast_mode,
@@ -977,8 +770,10 @@ if start_clicked:
             classified_total=int(totals["classified_total"]),
         )
     split_box.caption(
-        f"Candidates: raw {int(totals['raw_candidates'])} -> unique {int(totals['unique_candidates'])} | "
-        f"processed {int(totals['processed'])} | fetch failures {int(totals['fetch_failures'])} | "
+        f"Candidates: raw {int(totals['raw_candidates'])} -> "
+        f"unique {int(totals['unique_candidates'])} | "
+        f"processed {int(totals['processed'])} | "
+        f"fetch failures {int(totals['fetch_failures'])} | "
         f"skipped stalled {int(totals['skipped_due_to_stall'])}"
     )
 
@@ -992,22 +787,22 @@ if start_clicked:
         }
         for r in rows
     ]
-    table_rows = [r for r in result_rows if r["label"] == "table"]
-    uncertain_rows = [r for r in result_rows if r["label"] == "uncertain"]
-    normal_rows = [r for r in result_rows if r["label"] == "normal"]
+    table_rows_data = [r for r in result_rows if r["label"] == "table"]
+    uncertain_rows_data = [r for r in result_rows if r["label"] == "uncertain"]
+    normal_rows_data = [r for r in result_rows if r["label"] == "normal"]
 
     with table_results_box.container():
-        st.subheader(f"Detected Tables ({len(table_rows)})")
-        st.dataframe(table_rows, use_container_width=True, height=280)
+        st.subheader(f"Detected Tables ({len(table_rows_data)})")
+        st.dataframe(table_rows_data, use_container_width=True, height=280)
 
     with normal_results_box.container():
-        st.subheader(f"Detected Normal Images ({len(normal_rows)})")
-        st.dataframe(normal_rows, use_container_width=True, height=280)
+        st.subheader(f"Detected Normal Images ({len(normal_rows_data)})")
+        st.dataframe(normal_rows_data, use_container_width=True, height=280)
 
     if flag_uncertain:
         with uncertain_results_box.container():
-            st.subheader(f"Flagged Uncertain Images ({len(uncertain_rows)})")
-            st.dataframe(uncertain_rows, use_container_width=True, height=220)
+            st.subheader(f"Flagged Uncertain Images ({len(uncertain_rows_data)})")
+            st.dataframe(uncertain_rows_data, use_container_width=True, height=220)
 
     csv_bytes = Path(output_path).read_bytes()
     st.download_button(
@@ -1033,85 +828,75 @@ if start_clicked:
         use_container_width=True,
     )
 
-    if table_dir and Path(table_dir).exists():
-        table_files = sorted(
-            [p for p in Path(table_dir).iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}]
-        )
-        with table_gallery_box.container():
-            st.subheader(f"Saved Table Image Gallery ({len(table_files)})")
-            if table_files:
-                # Gallery with interactive "Mark as Normal" buttons is rendered
-                # below (outside this block) so it persists across reruns.
-                pass
-            else:
-                st.info("No table images were saved for this run.")
+    st.success(f"Completed. Results saved to `{output_path}` and `.crawler.db`.")
 
-    st.success(f"Completed. Results saved to `{output_path}`.")
 
-# ── Persistent interactive table gallery (renders from session state, survives reruns) ──
+# ── Persistent interactive table gallery ──────────────────────────────────────
+# Renders from session state so it survives Streamlit reruns triggered by button clicks.
 _gallery_rows: List[ImageResult] = st.session_state.get("_scan_results") or []
-_gallery_table_dir: str = st.session_state.get("_scan_table_dir", "")
 _marked_normal: set = st.session_state.get("_manually_marked_normal", set())
 
-if _gallery_rows and _gallery_table_dir and Path(_gallery_table_dir).exists():
-    _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
-    _all_files = sorted(p for p in Path(_gallery_table_dir).iterdir() if p.suffix.lower() in _IMAGE_EXTS)
-
-    # Build a lookup: url_digest (14-char sha1 prefix used in filename) → file path
-    _digest_to_file: Dict[str, Path] = {}
-    for _p in _all_files:
-        if _p.stem.startswith("table_"):
-            _digest_to_file[_p.stem[len("table_"):]] = _p
-
-    # Map each table-labelled result to its saved file (if any)
-    _table_items = []  # list of (ImageResult, Path | None)
-    for _r in _gallery_rows:
-        if _r.label != "table" and _r.image_url not in _marked_normal:
-            continue
-        if _r.image_url in _marked_normal:
-            continue  # already corrected — skip from gallery
-        _url_digest = hashlib.sha1(_r.image_url.encode("utf-8")).hexdigest()[:14]
-        _file = _digest_to_file.get(_url_digest)
-        if _file is not None:
-            _table_items.append((_r, _file))
+if _gallery_rows:
+    # Only show tables that haven't been manually corrected in this session.
+    _table_items: List[ImageResult] = [
+        r
+        for r in _gallery_rows
+        if r.label == "table" and r.image_url not in _marked_normal
+    ]
 
     with table_gallery_box.container():
         _active_count = len(_table_items)
-        _saved_count = len(_all_files)
         _corrected_count = len(_marked_normal)
 
-        st.subheader(f"Table Image Gallery — {_active_count} active / {_saved_count} saved")
+        st.subheader(f"Table Image Gallery — {_active_count} active")
 
         if _corrected_count:
             st.success(
-                f"✅ {_corrected_count} image{'s' if _corrected_count != 1 else ''} manually marked as normal "
-                f"and written to cache — future runs will skip {'them' if _corrected_count != 1 else 'it'}."
+                f"✅ {_corrected_count} image{'s' if _corrected_count != 1 else ''} manually "
+                f"marked as normal and written to cache — future runs will skip "
+                f"{'them' if _corrected_count != 1 else 'it'}."
             )
 
         if not _table_items:
             if _corrected_count:
                 st.info("All detected table images in this run have been marked as normal.")
             else:
-                st.info("No table images were saved for this run.")
+                st.info("No table images were detected in this run.")
         else:
-            st.caption("Click **Mark as Normal** on any image that was misclassified. The correction is saved to the cache immediately.")
+            st.caption(
+                "Images are loaded directly from their source URLs. "
+                "Click **Mark as Normal** on any image that was misclassified — "
+                "the correction is saved to the cache immediately."
+            )
             _COLS = 3
             for _i in range(0, len(_table_items), _COLS):
-                _batch = _table_items[_i: _i + _COLS]
+                _batch = _table_items[_i : _i + _COLS]
                 _cols = st.columns(_COLS)
-                for _col, (_row, _img_file) in zip(_cols, _batch):
+                for _col, _r in zip(_cols, _batch):
                     with _col:
-                        st.image(str(_img_file), use_container_width=True)
+                        # Display image directly from its source URL — no local file needed.
+                        try:
+                            st.image(_r.image_url, use_container_width=True)
+                        except Exception:
+                            st.warning("⚠️ Could not load image preview.")
                         st.caption(
-                            f"Score: **{_row.score:.4f}**  \n"
-                            f"[view image]({_row.image_url})  \n"
-                            f"[source page]({_row.page_url})"
+                            f"Score: **{_r.score:.4f}**  \n"
+                            f"[view image]({_r.image_url})  \n"
+                            f"[source page]({_r.page_url})"
+                        )
+                        _btn_disabled = not bool(_r.image_hash)
+                        _btn_help = (
+                            "Overrides this classification to 'normal' and updates the cache "
+                            "so future runs won't flag it again."
+                            if _r.image_hash
+                            else "Hash unavailable (fetch may have failed); cannot update cache."
                         )
                         if st.button(
                             "✅ Mark as Normal",
-                            key=f"mark_{_img_file.stem}",
+                            key=f"mark_{hashlib.sha1(_r.image_url.encode()).hexdigest()[:12]}",
                             use_container_width=True,
-                            help="Overrides this classification to 'normal' and updates the cache so future runs won't flag it again.",
+                            disabled=_btn_disabled,
+                            help=_btn_help,
                         ):
-                            _apply_mark_as_normal(_img_file, _row.image_url)
+                            _apply_mark_as_normal(_r.image_hash, _r.image_url)
                             st.rerun()

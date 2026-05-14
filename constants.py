@@ -1,5 +1,5 @@
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff")
@@ -18,7 +18,11 @@ USER_AGENT = (
 DEFAULT_TABLE_SCORE_THRESHOLD = 0.85
 CLASSIFIER_VERSION = "v69"
 TABLE_URL_HINT_WORDS = ("table", "tabela")
-CACHE_FILENAME = ".crawler_classification_cache.csv"
+
+# Single SQLite file used for both the classification cache and run results.
+# Replaces the old .crawler_classification_cache.csv and per-run results.csv files.
+DB_FILENAME = ".crawler.db"
+
 TABLE_WORDS = {
     "total",
     "subtotal",
@@ -56,3 +60,6 @@ class ImageResult:
     label: str
     score: float
     reason: str
+    # SHA-1 hex digest of the raw image bytes — stored in the DB so the webapp
+    # can issue "mark as normal" corrections without re-fetching the image.
+    image_hash: str = field(default="")
