@@ -55,6 +55,7 @@ def crawl_site(
     progress_callback: Optional[Callable[[dict], None]] = None,
     target_urls: Optional[Sequence[str]] = None,
     listing_urls: Optional[Sequence[str]] = None,
+    disable_cache: bool = False,
 ) -> List[ImageResult]:
     """
     Crawl *start_url* and classify every image found.
@@ -79,12 +80,15 @@ def crawl_site(
     start_time = time.time()
     last_heartbeat = start_time
 
-    classification_cache = load_classification_cache(
-        fast_mode,
-        turbo_mode,
-        table_score_threshold=table_score_threshold,
-        flag_uncertain=flag_uncertain,
-    )
+    if disable_cache:
+        classification_cache: Dict[str, tuple] = {}
+    else:
+        classification_cache = load_classification_cache(
+            fast_mode,
+            turbo_mode,
+            table_score_threshold=table_score_threshold,
+            flag_uncertain=flag_uncertain,
+        )
 
     if crawl_mode == "site":
         scan_scope = "whole_site"
@@ -434,17 +438,20 @@ def crawl_site(
         owns_classification = False
         wait_event: Optional[threading.Event] = None
 
-        with cache_lock:
-            cached = classification_cache.get(image_hash)
-            if cached is None:
-                wait_event = in_flight_hashes.get(image_hash)
-                if wait_event is None:
-                    wait_event = threading.Event()
-                    in_flight_hashes[image_hash] = wait_event
-                    owns_classification = True
+        if not disable_cache:
+            with cache_lock:
+                cached = classification_cache.get(image_hash)
+                if cached is None:
+                    wait_event = in_flight_hashes.get(image_hash)
+                    if wait_event is None:
+                        wait_event = threading.Event()
+                        in_flight_hashes[image_hash] = wait_event
+                        owns_classification = True
 
-        if cached is not None:
-            return page_url, image_url, cached[0], cached[1], cached[2], image_hash, True
+            if cached is not None:
+                return page_url, image_url, cached[0], cached[1], cached[2], image_hash, True
+        else:
+            owns_classification = True
 
         if not owns_classification and wait_event is not None:
             wait_event.wait()
@@ -481,8 +488,9 @@ def crawl_site(
             if label == "table" and score <= table_score_threshold:
                 label = "normal"
                 reason = f"{reason}_guarded_threshold"
-            with cache_lock:
-                classification_cache[image_hash] = (label, score, reason)
+            if not disable_cache:
+                with cache_lock:
+                    classification_cache[image_hash] = (label, score, reason)
             return page_url, image_url, label, score, reason, image_hash, False
         finally:
             if wait_event is not None and owns_classification:
@@ -579,13 +587,14 @@ def crawl_site(
     if renderer is not None:
         renderer.close()
 
-    save_classification_cache(
-        classification_cache,
-        fast_mode,
-        turbo_mode,
-        table_score_threshold=table_score_threshold,
-        flag_uncertain=flag_uncertain,
-    )
+    if not disable_cache:
+        save_classification_cache(
+            classification_cache,
+            fast_mode,
+            turbo_mode,
+            table_score_threshold=table_score_threshold,
+            flag_uncertain=flag_uncertain,
+        )
 
     # Persist results to the database.
     if run_id:

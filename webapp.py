@@ -182,6 +182,15 @@ with st.sidebar:
     )
     heartbeat_seconds = st.number_input("Heartbeat seconds", min_value=1.0, value=10.0, step=1.0)
     ocr_workers = st.number_input("OCR workers", min_value=1, value=default_workers, step=1)
+    st.divider()
+    disable_cache = st.toggle(
+        "Disable cache",
+        value=False,
+        help=(
+            "Completely turns off the classification cache. "
+            "Images won't be looked up in the cache and results won't be saved to it."
+        ),
+    )
 
 # ── Parse multi-line URL inputs ──────────────────────────────────────────────
 parsed_target_urls: List[str] = (
@@ -220,4 +229,5 @@ with _tab_scanner:
         flag_uncertain=flag_uncertain,
         heartbeat_seconds=float(heartbeat_seconds),
         ocr_workers=int(ocr_workers),
+        disable_cache=disable_cache,
     )

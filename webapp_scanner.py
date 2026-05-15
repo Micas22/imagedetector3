@@ -39,9 +39,10 @@ def _apply_mark_as_normal(image_hash: str, image_url: str) -> None:
     flag_unc = run_cfg.get("flag_uncertain", False)
 
     # ── Update the SQLite classification cache ────────────────────────────────
-    cache = load_classification_cache(fast, turbo, threshold, flag_unc)
-    cache[image_hash] = ("normal", 0.0, "manually_marked_normal")
-    save_classification_cache(cache, fast, turbo, threshold, flag_unc)
+    if not run_cfg.get("disable_cache", False):
+        cache = load_classification_cache(fast, turbo, threshold, flag_unc)
+        cache[image_hash] = ("normal", 0.0, "manually_marked_normal")
+        save_classification_cache(cache, fast, turbo, threshold, flag_unc)
 
     rid = st.session_state.get("_scan_run_id", "")
     if rid:
@@ -91,6 +92,7 @@ def render_scanner_tab(
     flag_uncertain: bool,
     heartbeat_seconds: float,
     ocr_workers: int,
+    disable_cache: bool = False,
 ) -> None:
     """Render the full Scanner tab content."""
 
@@ -376,6 +378,7 @@ def render_scanner_tab(
                     progress_callback=_on_progress,
                     target_urls=parsed_target_urls if crawl_mode == "urls" else None,
                     listing_urls=parsed_listing_urls if crawl_mode == "paginated_listing" else None,
+                    disable_cache=disable_cache,
                 )
             except StopIteration:
                 rows = []
@@ -395,6 +398,7 @@ def render_scanner_tab(
             "turbo_mode": turbo_mode,
             "table_score_threshold": configured_threshold,
             "flag_uncertain": flag_uncertain,
+            "disable_cache": disable_cache,
         }
 
         progress_bar.progress(1.0)
