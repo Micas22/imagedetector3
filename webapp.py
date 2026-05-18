@@ -175,13 +175,9 @@ with st.sidebar:
         help="Higher means stricter. 100% keeps the current table detection threshold.",
         disabled=(preset != "custom"),
     )
-    flag_uncertain = st.checkbox(
-        "Flag uncertain images",
-        value=False,
-        help="Marks images as uncertain when they are very close to being labeled as a table.",
-    )
-    heartbeat_seconds = st.number_input("Heartbeat seconds", min_value=1.0, value=10.0, step=1.0)
-    ocr_workers = st.number_input("OCR workers", min_value=1, value=default_workers, step=1)
+    flag_uncertain = False
+    heartbeat_seconds = 10.0
+    ocr_workers = default_workers
     st.divider()
     disable_cache = st.toggle(
         "Disable cache",

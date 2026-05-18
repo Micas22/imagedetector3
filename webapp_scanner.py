@@ -96,12 +96,7 @@ def render_scanner_tab(
 ) -> None:
     """Render the full Scanner tab content."""
 
-    st.markdown("### Output Preview")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.code(f"run_id: {run_id}", language="text")
-    with col2:
-        st.code(".crawler.db → run_results", language="text")
+
 
     progress_bar = st.progress(0)
     status_box = st.empty()
