@@ -37,6 +37,7 @@ from database import (
     write_results_db,
 )
 from orchestrator import crawl_site, format_results_csv_bytes
+from queue_manager import scan_queue
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -219,27 +220,33 @@ def scan(body: ScanRequest):
     configured_threshold = DEFAULT_TABLE_SCORE_THRESHOLD * threshold_multiplier
     workers = _resolve_workers(body.ocr_workers)
 
+    job_id = scan_queue.enqueue()
     try:
-        rows: List[ImageResult] = crawl_site(
-            start_url=body.url.strip(),
-            run_id=run_id,
-            render_js=body.render_js,
-            heartbeat_seconds=body.heartbeat_seconds,
-            fast_mode=body.fast_mode,
-            turbo_mode=body.turbo_mode,
-            table_score_threshold=configured_threshold,
-            flag_uncertain=body.flag_uncertain,
-            ocr_workers=workers,
-            crawl_mode=body.crawl_mode.value,
-            max_pages=body.max_pages,
-            target_urls=body.target_urls if body.crawl_mode == CrawlMode.urls else None,
-            listing_urls=body.listing_urls if body.crawl_mode == CrawlMode.paginated_listing else None,
-            disable_cache=body.disable_cache,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Scan failed: {exc}")
+        scan_queue.wait_for_turn(job_id)
+
+        try:
+            rows: List[ImageResult] = crawl_site(
+                start_url=body.url.strip(),
+                run_id=run_id,
+                render_js=body.render_js,
+                heartbeat_seconds=body.heartbeat_seconds,
+                fast_mode=body.fast_mode,
+                turbo_mode=body.turbo_mode,
+                table_score_threshold=configured_threshold,
+                flag_uncertain=body.flag_uncertain,
+                ocr_workers=workers,
+                crawl_mode=body.crawl_mode.value,
+                max_pages=body.max_pages,
+                target_urls=body.target_urls if body.crawl_mode == CrawlMode.urls else None,
+                listing_urls=body.listing_urls if body.crawl_mode == CrawlMode.paginated_listing else None,
+                disable_cache=body.disable_cache,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Scan failed: {exc}")
+    finally:
+        scan_queue.mark_done(job_id)
 
     table_count = sum(1 for r in rows if r.label == "table")
     uncertain_count = sum(1 for r in rows if r.label == "uncertain")

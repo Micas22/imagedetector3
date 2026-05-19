@@ -8,6 +8,8 @@ from typing import Dict, List
 import requests
 import streamlit as st
 
+from queue_manager import scan_queue
+
 from constants import DEFAULT_TABLE_SCORE_THRESHOLD, ImageResult
 from classifier import classify_image
 from database import (
@@ -126,20 +128,54 @@ def render_scanner_tab(
     if "_manually_marked_normal" not in st.session_state:
         st.session_state["_manually_marked_normal"] = set()
 
+    # ── queue session state ──────────────────────────────────────────────────────
+    if "_queue_job_id" not in st.session_state:
+        st.session_state["_queue_job_id"] = None
+
     # ── Scan / evaluate button ────────────────────────────────────────────────────
     _scan_button_label = "🔍 Evaluate Image" if eval_mode == "single_image" else "🔍 Start Scan"
     _scan_clicked = st.button(
         _scan_button_label,
         type="primary",
         use_container_width=True,
-        disabled=bool(st.session_state.get("_crawl_running")),
+        disabled=bool(st.session_state.get("_queue_job_id")),
     )
 
+    # ── Enqueue on fresh click ────────────────────────────────────────────────────
     if _scan_clicked:
-        stop_event = threading.Event()
-        st.session_state["_stop_event"] = stop_event
+        _new_job_id = scan_queue.enqueue()
+        st.session_state["_queue_job_id"] = _new_job_id
         st.session_state["_crawl_running"] = True
         st.session_state["_manually_marked_normal"] = set()
+
+    # ── Queue position check ─────────────────────────────────────────────────────
+    _should_execute_scan = False
+    _queue_job_id = st.session_state.get("_queue_job_id")
+
+    if _queue_job_id:
+        _queue_pos = scan_queue.get_position(_queue_job_id)
+        if _queue_pos == 0:
+            _should_execute_scan = True
+        elif _queue_pos > 0:
+            status_box.info(
+                f"⏳ **In queue, position: {_queue_pos}** — "
+                f"waiting for {_queue_pos} other scan{'s' if _queue_pos > 1 else ''} to finish…"
+            )
+            if st.button("❌ Cancel Queue", key="_cancel_queue_btn"):
+                scan_queue.cancel(_queue_job_id)
+                st.session_state["_queue_job_id"] = None
+                st.session_state["_crawl_running"] = False
+                st.rerun()
+            time.sleep(2)
+            st.rerun()
+        else:
+            # position == -1: job was removed externally
+            st.session_state["_queue_job_id"] = None
+            st.session_state["_crawl_running"] = False
+
+    if _should_execute_scan:
+        stop_event = threading.Event()
+        st.session_state["_stop_event"] = stop_event
 
         crawl_wall_start = time.monotonic()
 
@@ -483,6 +519,10 @@ def render_scanner_tab(
         )
 
         st.success(f"Completed. Results stored in `.crawler.db` (run_id `{run_id}`).")
+
+        # ── Release queue slot so the next waiting job can start ──────────────
+        scan_queue.mark_done(_queue_job_id)
+        st.session_state["_queue_job_id"] = None
 
 
     # ── Persistent interactive table gallery ──────────────────────────────────────
