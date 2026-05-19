@@ -74,14 +74,14 @@ with st.sidebar:
 
     eval_mode = st.radio(
         "Evaluation mode",
-        options=[("crawl", "Scan page/site"), ("single_image", "Evaluate one image only")],
+        options=[("crawl", "Scan page/site"), ("single_image", "Evaluate image(s)")],
         format_func=lambda option: option[1],
     )[0]
     url = ""
     crawl_mode = "page"
     single_image_source = "url"
     single_image_url = ""
-    uploaded_single_image = None
+    uploaded_images = []
     single_image_page_url = ""
     target_urls_input = ""
     listing_urls_input = ""
@@ -127,9 +127,10 @@ with st.sidebar:
                 "Image URL", placeholder="https://example.com/image.png"
             )
         else:
-            uploaded_single_image = st.file_uploader(
-                "Upload image",
+            uploaded_images = st.file_uploader(
+                "Upload image(s)",
                 type=["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
+                accept_multiple_files=True,
             )
         single_image_page_url = st.text_input(
             "Source page URL (optional)",
@@ -214,7 +215,7 @@ with _tab_scanner:
         crawl_mode=crawl_mode,
         single_image_source=single_image_source,
         single_image_url=single_image_url,
-        uploaded_single_image=uploaded_single_image,
+        uploaded_images=uploaded_images,
         single_image_page_url=single_image_page_url,
         parsed_target_urls=parsed_target_urls,
         parsed_listing_urls=parsed_listing_urls,

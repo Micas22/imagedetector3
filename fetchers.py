@@ -1,9 +1,13 @@
+import re
 import time
 import warnings
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
+import cv2
+import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
 from requests.exceptions import SSLError
 
 from constants import USER_AGENT
@@ -123,9 +127,7 @@ def fetch_image_bytes(
     timeout: Tuple[float, float] = (4, 12),
     turbo_mode: bool = False,
 ) -> Tuple[Optional[bytes], str]:
-    import re
-    import cv2
-    import numpy as np
+
 
     def _is_valid_image_bytes(content: bytes) -> bool:
         if not content:
@@ -141,10 +143,11 @@ def fetch_image_bytes(
 
     last_reason = "fetch_unknown_error"
     connect_timeout, read_timeout = timeout
+    parsed_page = urlparse(page_url)
     request_headers = {
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         "Referer": page_url,
-        "Origin": f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}",
+        "Origin": f"{parsed_page.scheme}://{parsed_page.netloc}",
     }
     if turbo_mode:
         connect_timeout, read_timeout = (1.5, 3.5)
@@ -223,4 +226,7 @@ def fetch_image_bytes(
 def shared_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
     return session

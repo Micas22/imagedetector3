@@ -81,7 +81,7 @@ def render_scanner_tab(
     crawl_mode: str,
     single_image_source: str,
     single_image_url: str,
-    uploaded_single_image,
+    uploaded_images,
     single_image_page_url: str,
     parsed_target_urls: List[str],
     parsed_listing_urls: List[str],
@@ -289,7 +289,8 @@ def render_scanner_tab(
         configured_threshold = DEFAULT_TABLE_SCORE_THRESHOLD * threshold_multiplier
 
         if eval_mode == "single_image":
-            status_box.info("Evaluating single image...")
+            # ── Build a list of (image_bytes, resolved_url) pairs ─────────────
+            image_items: List[tuple] = []
             if single_image_source == "url":
                 single_url = single_image_url.strip()
                 try:
@@ -302,49 +303,59 @@ def render_scanner_tab(
                 if not image_bytes:
                     st.error("Image URL returned an empty response body.")
                     st.stop()
-                resolved_image_url = single_url
+                image_items.append((image_bytes, single_url))
             else:
-                image_bytes = (
-                    uploaded_single_image.getvalue() if uploaded_single_image is not None else b""
-                )
-                if not image_bytes:
-                    st.error("Uploaded image is empty.")
+                if not uploaded_images:
+                    st.error("No images uploaded.")
                     st.stop()
-                upload_name = (
-                    uploaded_single_image.name
-                    if uploaded_single_image is not None
-                    else "uploaded_image"
-                )
-                resolved_image_url = f"upload://{upload_name}"
+                for uploaded_file in uploaded_images:
+                    file_bytes = uploaded_file.getvalue()
+                    if not file_bytes:
+                        continue
+                    image_items.append((file_bytes, f"upload://{uploaded_file.name}"))
+                if not image_items:
+                    st.error("All uploaded images are empty.")
+                    st.stop()
 
-            label, score, reason = classify_image(
-                image_bytes=image_bytes,
-                image_url=resolved_image_url,
-                fast_mode=fast_mode,
-                turbo_mode=turbo_mode,
-                table_score_threshold=configured_threshold,
-                flag_uncertain=flag_uncertain,
-            )
-            image_hash = hashlib.sha1(image_bytes).hexdigest()
-            source_page = single_image_page_url.strip() or resolved_image_url
-            rows = [
-                ImageResult(
-                    page_url=source_page,
+            num_images = len(image_items)
+            status_box.info(f"Evaluating {num_images} image{'s' if num_images != 1 else ''}...")
+            rows: List[ImageResult] = []
+            source_page = single_image_page_url.strip()
+
+            for idx, (image_bytes, resolved_image_url) in enumerate(image_items, 1):
+                label, score, reason = classify_image(
+                    image_bytes=image_bytes,
                     image_url=resolved_image_url,
-                    label=label,
-                    score=score,
-                    reason=reason,
-                    image_hash=image_hash,
+                    fast_mode=fast_mode,
+                    turbo_mode=turbo_mode,
+                    table_score_threshold=configured_threshold,
+                    flag_uncertain=flag_uncertain,
                 )
-            ]
-            totals["processed"] = 1
-            totals["total"] = 1
+                image_hash = hashlib.sha1(image_bytes).hexdigest()
+                rows.append(
+                    ImageResult(
+                        page_url=source_page or resolved_image_url,
+                        image_url=resolved_image_url,
+                        label=label,
+                        score=score,
+                        reason=reason,
+                        image_hash=image_hash,
+                    )
+                )
+                if label == "table":
+                    totals["tables"] += 1
+                elif label == "uncertain":
+                    totals["uncertain"] += 1
+                else:
+                    totals["normal"] += 1
+                totals["processed"] = idx
+                totals["total"] = num_images
+                progress_bar.progress(float(idx) / float(num_images))
+
             totals["elapsed_seconds"] = 0.0
-            totals["tables"] = 1 if label == "table" else 0
-            totals["uncertain"] = 1 if label == "uncertain" else 0
-            totals["normal"] = 1 if label == "normal" else 0
-            progress_bar.progress(1.0)
-            status_box.success("Single image evaluation finished.")
+            status_box.success(
+                f"Evaluation finished — {num_images} image{'s' if num_images != 1 else ''} processed."
+            )
             write_results_db(run_id, rows)
 
         else:

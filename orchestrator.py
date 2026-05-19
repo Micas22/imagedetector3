@@ -422,12 +422,15 @@ def crawl_site(
     cache_lock = threading.Lock()
     in_flight_hashes: Dict[str, threading.Event] = {}
     workers = max(1, int(ocr_workers))
+    _tls = threading.local()
 
     def process_image(
         page_url: str, image_url: str
     ) -> Optional[Tuple[str, str, str, float, str, str, bool]]:
         """Returns (page_url, image_url, label, score, reason, image_hash, was_cached)."""
-        local_session = shared_session()
+        if not hasattr(_tls, 'session'):
+            _tls.session = shared_session()
+        local_session = _tls.session
         content, fetch_reason = fetch_image_bytes(
             local_session, image_url, page_url, turbo_mode=turbo_mode
         )
