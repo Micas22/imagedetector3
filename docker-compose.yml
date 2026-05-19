@@ -1,0 +1,32 @@
+services:
+  imagedetector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: imagedetector3:latest
+    container_name: imagedetector3
+    restart: unless-stopped
+
+    ports:
+      - "8501:8501"   # Streamlit webapp
+      - "8000:8000"   # FastAPI REST API
+
+    volumes:
+      # Persist the SQLite database across container restarts
+      - db_data:/app/data
+      # Cache HuggingFace models so they aren't re-downloaded on every restart
+      - hf_cache:/app/.cache/huggingface
+
+    environment:
+      - HF_HOME=/app/.cache/huggingface
+      - TRANSFORMERS_CACHE=/app/.cache/huggingface
+      - FLAGS_use_mkldnn=0
+      # Optional: set to 1 to disable Streamlit's usage telemetry
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+
+    # Give the container enough shared memory for Playwright Chromium
+    shm_size: "512mb"
+
+volumes:
+  db_data:
+  hf_cache:

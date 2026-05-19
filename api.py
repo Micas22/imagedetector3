@@ -224,7 +224,7 @@ def scan(body: ScanRequest):
     try:
         scan_queue.wait_for_turn(job_id)
 
-        try:
+        try: 
             rows: List[ImageResult] = crawl_site(
                 start_url=body.url.strip(),
                 run_id=run_id,

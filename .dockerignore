@@ -1,0 +1,30 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+.env
+.venv
+venv/
+env/
+
+# Keep the DB out of the image — it is mounted as a volume at runtime
+.crawler.db
+
+# Local run artefacts
+runs/
+*.csv
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Docker files themselves don't need to be in the context
+docker-compose*.yml
+Dockerfile

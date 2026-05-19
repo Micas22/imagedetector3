@@ -1,0 +1,32 @@
+# Core web framework
+streamlit==1.57.0
+fastapi==0.136.1
+uvicorn==0.46.0
+starlette==1.0.0
+
+# HTTP / crawling
+requests==2.33.1
+playwright==1.59.0
+beautifulsoup4==4.14.3
+
+# Image processing
+opencv-python-headless==4.13.0.92
+Pillow==12.2.0
+numpy==2.3.5
+
+# ML / classification
+torch==2.11.0
+torchvision==0.26.0
+transformers==5.8.0
+timm==1.0.26
+safetensors==0.7.0
+huggingface_hub==1.12.2
+
+# OCR (optional — gracefully skipped if unavailable)
+paddleocr==3.5.0
+paddlepaddle==3.3.1
+
+# Data / utils
+pandas==3.0.2
+pydantic==2.13.3
+python-multipart==0.0.27
