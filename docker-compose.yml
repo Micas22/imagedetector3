@@ -27,6 +27,12 @@ services:
     # Give the container enough shared memory for Playwright Chromium
     shm_size: "512mb"
 
+    # Hard memory cap — container is OOM-killed if it exceeds 1 GB
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
 volumes:
   db_data:
   hf_cache:
